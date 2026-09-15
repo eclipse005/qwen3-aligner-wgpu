@@ -4,18 +4,26 @@
 name = "qwen3-aligner-wgpu"
 version = "0.1.0"
 edition = "2021"
-description = "wgpu inference backend for Qwen3-ForcedAligner"
+description = "Qwen3-ForcedAligner in Rust — wgpu and CPU inference"
+license = "Apache-2.0"
+repository = "https://github.com/eclipse005/qwen3-aligner-wgpu"
+readme = "README.md"
+keywords = ["forced-alignment", "asr", "wgpu", "gpu", "qwen"]
+categories = ["multimedia::audio", "science"]
 
 [lib]
 name = "qwen3_aligner_wgpu"
 path = "src/lib.rs"
 
+[[bin]]
+name = "align"
+path = "src/bin/align.rs"
 
 [features]
 default = ["ja"]
-# Japanese word segmentation.  `nagisa_rs` is a path dependency on a sibling
-# checkout (`D:\nagisa-rs`), so it is optional: the crate must still build
-# wherever that tree is absent, just without `--language Japanese`.
+# Japanese word segmentation, via a pure-Rust nagisa.  Optional because it
+# pulls a git dependency with a ~25 MB embedded model; without it the crate
+# still builds and aligns every other language.
 ja = ["dep:nagisa_rs"]
 
 [dependencies]
@@ -36,7 +44,7 @@ gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
 unicode-general-category = "1.1.0"
-nagisa_rs = { version = "0.1.0", path = "../nagisa-rs", optional = true }
+nagisa_rs = { git = "https://github.com/eclipse005/nagisa-rs.git", rev = "cd7726e78ede8451c72cc0fabfd55d2c4ed62442", optional = true }
 thiserror = "2.0.20"
 
 [build-dependencies]

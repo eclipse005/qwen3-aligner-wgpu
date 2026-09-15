@@ -1,0 +1,90 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The aligner binary is what gets shipped; the library is by-catch.
+  BIN: align
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The vendored soxr is built by build.rs via cmake, which the runner has.
+      - run: cargo test --release --all-targets
+
+  package:
+    name: ${{ matrix.name }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # `macos-14` and later are Apple Silicon runners, so this is a native
+          # arm64 build rather than a cross-compile.
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
+
+      # Package the binary alone: the checkpoint is ~1.7 GB and licensed
+      # separately, so it is fetched by whoever runs this, not shipped here.
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ env.BIN }}-${{ matrix.name }}.tar.gz ${{ env.BIN }}
+          cd ../../..
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" `
+                           -DestinationPath "${{ env.BIN }}-${{ matrix.name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ matrix.name }}
+          path: |
+            ${{ env.BIN }}-${{ matrix.name }}.tar.gz
+            ${{ env.BIN }}-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

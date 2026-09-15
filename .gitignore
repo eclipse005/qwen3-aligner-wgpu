@@ -1,26 +1,13 @@
-# CUDA golden dumps + torch reference dumps (1.5 GB; regenerate — see
-# ROADMAP-wgpu.md "Reproducing")
-/golden/
-
-# runtime debug dumps (regenerated on every prefill_check run)
-/*.bin
-
 # local build output
 /target/
-/cuda_ref/target/
 
-# alignment dumps vs Python (regenerable)
-/align_dump/
+# checkpoints and audio: fetched, not committed
+/models/
+*.wav
 
-# WER/CER evaluation data (FLEURS tars + extracted wavs; see docs/eval-fleurs.md)
-/eval_data/
-
-# python bytecode from the eval tools
+# python bytecode, if any tooling is dropped in later
 __pycache__/
 *.pyc
-
-# probe dump bins (regenerable via examples/exp_probe.rs + src/bin/exp_probe.rs)
-exp_probe/*.bin
 
 # Command Code session state (taste memory, session logs)
 /.commandcode/
