@@ -1,14 +1,10 @@
 //! Device / queue wrapper and buffer plumbing.
 //!
-//! Everything the engine needs from wgpu lives here so the rest of the crate can
-//! stay in terms of buffers + dispatches.  Two conventions matter for the whole
-//! engine and are enforced by the constructors below:
+//! Two conventions, enforced by the constructors below:
 //!
 //! * storage buffers are always allocated 16-byte padded, so a `array<vec4<u32>>`
 //!   view over an f16 payload never runs off the end;
-//! * every activation tensor is stored the way CUDA stores it — f16, indexed as
-//!   `__half2` words (2 halves per `u32`).  Keeping the byte layout identical to
-//!   the CUDA backend is what lets the two store bit-comparable values.
+//! * activation tensors are f16, indexed as two halves per `u32`.
 
 use anyhow::{bail, Context, Result};
 
@@ -28,10 +24,9 @@ pub struct Gpu {
 
 /// Which device to run on.
 ///
-/// One binary, several devices is the whole point of the port, so the choice is
-/// explicit and enumerable rather than "whatever wgpu hands back": a caller can
-/// run on the integrated GPU while the discrete one is busy, pin a backend for
-/// an A/B, or address the same machine's adapters by index.
+/// The choice is explicit and enumerable rather than "whatever wgpu hands back":
+/// a caller can run on the integrated GPU while the discrete one is busy, pin a
+/// backend, or address the same machine's adapters by index.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceSelector {
     /// The default: the best GPU, on the runtime this engine is tuned for
@@ -39,14 +34,10 @@ pub enum DeviceSelector {
     #[default]
     Auto,
     /// A compute runtime and which device of it: `Runtime { api: Vulkan, index: 1 }`
-    /// for `vulkan:1`.  This is the axis users mean by "backend" — the same
-    /// shape as ONNX Runtime's execution providers and llama.cpp's
-    /// `CUDA0`/`Vulkan0`/`CPU` device names.
+    /// for `vulkan:1`.  This is the axis users mean by "backend".
     ///
-    /// Note what is *not* in here: the vendor.  Which vendor a card is belongs in
-    /// the listing, not in the choice — an NVIDIA card can be driven through
-    /// Vulkan, D3D12 or DML, and those are different code paths with different
-    /// numerics and different speeds.
+    /// The vendor is *not* part of the choice: an NVIDIA card can be driven
+    /// through Vulkan or D3D12, and those are different code paths.
     Runtime { api: wgpu::Backend, index: usize },
     /// The host implementation: the CPU audio tower plus
     /// [`crate::cpu_decoder::CpuTextDecoder`].  Needs no adapter at all, and is
@@ -61,10 +52,8 @@ pub enum DeviceSelector {
 
 /// The compute runtimes this engine can run on, in the order it tries them.
 ///
-/// `cpu` is our own implementation (see [`DeviceSelector::Cpu`]).  Note there is
-/// no `cuda` and no `dml`: this crate has no CUDA backend (that lives in the
-/// sibling CUDA port), and wgpu drives Windows through D3D12 **compute**, not
-/// DirectML.
+/// `cpu` is our own implementation (see [`DeviceSelector::Cpu`]).  On Windows
+/// wgpu drives the GPU through D3D12 **compute**, not DirectML.
 pub const RUNTIMES: &[(&str, wgpu::Backend)] = &[
     ("vulkan", wgpu::Backend::Vulkan),
     ("metal", wgpu::Backend::Metal),
@@ -125,10 +114,7 @@ impl DeviceSelector {
 }
 
 /// Default-selection order: discrete before integrated before virtual/CPU, then
-/// by graphics API.  Vulkan first because it is what this engine is tuned and
-/// verified against — the same GTX 1070 decodes 54 % faster on Vulkan than on
-/// D3D12 here, and one iGPU finished a clip on Vulkan that D3D12 did not finish
-/// in nine minutes — then Metal for macOS, then D3D12, then GL.
+/// by graphics API (Vulkan, Metal, D3D12, GL).
 fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
     let class = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => 0,
@@ -160,8 +146,8 @@ fn list_names(adapters: &[wgpu::Adapter]) -> String {
         .join(", ")
 }
 
-/// One enumerated adapter — everything you need to *choose* a device, and to
-/// know whether it can run this engine at all, without creating one.
+/// One enumerated adapter: what you need to choose a device, without creating
+/// one.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
@@ -179,7 +165,7 @@ pub struct DeviceInfo {
     pub subgroup_max: u32,
     pub timestamps: bool,
     /// Whether this runtime can persist compiled pipelines (`VkPipelineCache` /
-    /// `ID3D12PipelineLibrary`) — the fix for D3D12's ~5.5-minute build.
+    /// `ID3D12PipelineLibrary`).
     pub pipeline_cache: bool,
     /// PCI ids — information for the listing, never a selector.
     pub vendor_id: u32,
@@ -232,9 +218,9 @@ impl DeviceInfo {
 }
 
 /// Every adapter this instance can see, in wgpu's enumeration order — the order
-/// [`DeviceSelector::Index`] indexes into.  Note this is one entry per *(device,
-/// graphics API)* pair: the same physical GPU appears once per API it is
-/// reachable through.  Use [`list_device_groups`] for the device view.
+/// [`DeviceSelector::Index`] indexes into.  One entry per *(device, graphics
+/// API)* pair: the same physical GPU appears once per API it is reachable
+/// through.
 pub async fn list_devices() -> Vec<DeviceInfo> {
     let instance = wgpu::Instance::default();
     instance
@@ -246,10 +232,8 @@ pub async fn list_devices() -> Vec<DeviceInfo> {
 }
 
 /// One selectable target, named the way [`DeviceSelector::parse`] wants it:
-/// `vulkan:0`, `dx12:1`, …  This is the user-facing list — the runtime is the
-/// axis, the vendor and device class are *information*, because a card of one
-/// vendor is reachable through several runtimes and those are different code
-/// paths, with different limits to size allocations from.
+/// `vulkan:0`, `dx12:1`, …  The runtime is the axis; the vendor and device
+/// class are information.
 #[derive(Debug, Clone)]
 pub struct DeviceTarget {
     /// `<runtime>:<index>`, e.g. `vulkan:1` — feed it back via `--device`.
@@ -260,7 +244,7 @@ pub struct DeviceTarget {
 }
 
 impl DeviceTarget {
-    /// `vulkan:0  NVIDIA P104-100 (NVIDIA, dGPU, driver 572.75) binding 2047 MiB, subgroup 32`
+    /// `vulkan:0  NVIDIA … (NVIDIA, dGPU, driver 572.75) binding 2047 MiB, subgroup 32`
     pub fn describe(&self) -> String {
         let sg = if !self.info.subgroup {
             "no subgroup".to_string()
@@ -398,8 +382,8 @@ impl Gpu {
 
         // `Runtime { api, index }` picks the index-th *device* of that runtime,
         // ordered best-first (discrete before integrated), so `vulkan:1` is a
-        // stable name for "the second GPU Vulkan can see" — the llama.cpp
-        // convention.  `Auto` is that same ordering across all runtimes.
+        // stable name for "the second GPU Vulkan can see".  `Auto` uses that
+        // same ordering across all runtimes.
         let adapter = match &selector {
             DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -442,12 +426,11 @@ impl Gpu {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("qwen3-asr-wgpu"),
+                label: Some("qwen3-aligner-wgpu"),
                 // Timestamp queries gate the per-op step profiler; SUBGROUP lets
                 // `gemv` use warp shuffles instead of shared-memory butterflies.
                 // All three are intersected with what the adapter reports, so an
-                // adapter without them still gets a device (callers branch on
-                // `Gpu::features`).
+                // adapter without them still gets a device.
                 required_features: features
                     & (wgpu::Features::TIMESTAMP_QUERY
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
@@ -466,13 +449,11 @@ impl Gpu {
             eprintln!("[wgpu uncaptured error] {e}");
         }));
 
-        // Persisted pipeline cache: on D3D12 the compile is ~5.5 minutes for these
-        // kernels (measured on Intel *and* NVIDIA; Vulkan does it in ~6 s), and
-        // that is paid *per run* without a cache.  The key includes the adapter
-        // and driver so a driver update gets a fresh cache, and `fallback: true`
-        // means a stale or foreign cache is ignored rather than fatal.
-        // Only when the adapter actually offers it — `create_pipeline_cache`
-        // validates the feature and poisons the device otherwise.
+        // Persisted pipeline cache: the key includes the adapter and driver so a
+        // driver update gets a fresh cache, and `fallback: true` makes a stale or
+        // foreign cache a miss rather than fatal.  Only created when the adapter
+        // offers the feature — `create_pipeline_cache` validates it and poisons
+        // the device otherwise.
         let cache_supported = features.contains(wgpu::Features::PIPELINE_CACHE);
         let (pipeline_cache, pipeline_cache_path) = match pipeline_cache_path(&info) {
             Some(path) if cache_supported => {
@@ -622,10 +603,9 @@ impl Gpu {
     }
 
     /// Compile a WGSL module + compute pipeline, surfacing validation errors
-    /// instead of letting them turn into an opaque panic later.  `layout`
-    /// attaches an explicit pipeline layout — required whenever one bind group
-    /// is shared across sibling pipelines, because wgpu's implicit layouts are
-    /// pipeline-exclusive.
+    /// instead of letting them turn into an opaque panic.  `layout` attaches an
+    /// explicit pipeline layout — required when one bind group is shared across
+    /// sibling pipelines, since wgpu's implicit layouts are pipeline-exclusive.
     pub fn pipeline(
         &self,
         label: &str,
@@ -655,11 +635,9 @@ impl Gpu {
 }
 
 /// Where the pipeline cache for this adapter lives: one file per
-/// (vendor, device, backend, driver) under the user's cache directory.
-///
-/// Per-adapter rather than global because the blob is only valid for the driver
-/// that produced it, and keyed on the driver version so a driver update does not
-/// silently reuse a stale one.
+/// (vendor, device, backend, driver) under the user's cache directory.  The blob
+/// is only valid for the driver that produced it, so the driver version is part
+/// of the key.
 fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
     let root = std::env::var_os("QASR_CACHE_DIR")
         .map(std::path::PathBuf::from)
@@ -674,27 +652,19 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
         info.backend,
         info.driver_info.replace(['\\', '/', ':', ' '], "_")
     );
-    Some(root.join("qwen3-asr-wgpu").join(format!("{key}.pipeline_cache")))
+    Some(root.join("qwen3-aligner-wgpu").join(format!("{key}.pipeline_cache")))
 }
 
-/// Outstanding deferred-copy bytes tolerated before a flush.
-///
-/// wgpu defers every `queue.write_buffer` to the next submit and keeps the
-/// device-side staging alive until then.  Letting a multi-GiB model load
-/// accumulate into one submit overflows VRAM on WDDM drivers: copies silently
-/// land as zeros and the device is lost on the next dispatch (observed on
-/// Pascal for a 3.4 GiB load; 1.2 GiB happened to survive).  The CUDA engine
-/// never holds staging because `htod` copies are synchronous — this budget is
-/// the wgpu counterpart of that discipline: stage a bounded amount, then
-/// submit + wait, which retires the staging, before staging more.
+/// Outstanding deferred-copy bytes tolerated before a flush.  wgpu defers every
+/// `queue.write_buffer` to the next submit and holds the staging until then, so a
+/// multi-GiB load in one submit overflows VRAM on WDDM; stage a bounded amount,
+/// then submit and wait to retire it.
 const STAGING_BUDGET: u64 = 256 << 20;
 
-/// Load-time upload session with bounded outstanding staging.
-///
-/// Route every model-load transfer through one of these (`Gpu::uploader`);
-/// runtime-sized writes (rope tables, token slots, KV seeding) stay on the
-/// deferred [`Gpu::upload`] path, where queue ordering already guarantees
-/// visibility and the volumes are tiny.
+/// Load-time upload session with bounded outstanding staging.  Route every
+/// model-load transfer through one of these (`Gpu::uploader`); runtime-sized
+/// writes (rope tables, token slots, KV seeding) use the deferred [`Gpu::upload`]
+/// path, where queue ordering already guarantees visibility.
 pub struct BulkUpload<'a> {
     gpu: &'a Gpu,
     pending: u64,

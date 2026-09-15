@@ -1,24 +1,15 @@
 //! CPU text decoder — the runtime for machines with no usable GPU adapter, and
 //! the host-side oracle the GPU decoder can be diffed against.
 //!
-//! Design (mirrors the sibling CUDA port's `cpu_engine.rs`, which is the
-//! reference implementation the user pointed at):
-//!
 //! * **Activations are f32, weights are f16.**  Every linear reads its weight
 //!   matrix straight out of the mapped safetensors file and converts per
 //!   element, so a decode step streams half the bytes.  Accumulation is f32.
-//! * **Rayon parallelises every op** (rows of a linear, heads of an attention),
-//!   and the `gemm` crate is *not* used: at m=1 its dispatch is single-threaded
-//!   and a hand-rolled row-parallel dot product is both simpler and faster here.
+//! * **Rayon parallelises every op** (rows of a linear, heads of an attention).
 //! * **The f16 rounding points are the contract.**  The GPU stores activations
 //!   as f16 between ops (norm output, every linear output, the KV cache, the
 //!   attention output); reproducing exactly those roundings is what makes the
 //!   transcripts agree.  The *order* of the f32 accumulation inside a dot
-//!   product is deliberately different — the reference's own CPU and CUDA paths
-//!   differ there too, and both match the gold texts.
-//!
-//! Everything is verified by the same gate as the GPU path: run the fixtures
-//! with `--cpu-dec` and compare against the frozen python-hf texts.
+//!   product is deliberately different.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,10 +25,8 @@ use crate::weights::{self, RawTensor};
 /// the layout a GEMV wants to stream.
 ///
 /// The file's f16 is widened to f32 **once, at load**: the per-element software
-/// `f16 → f32` conversion (`half`'s, with its subnormal branches) cannot be
-/// vectorised, and measured it cost 5.2 s of a 5.4 s prefill — the kernels were
-/// conversion-bound at ~125 MB/s, not memory-bound.  As f32 the inner loop is a
-/// plain FMA chain the compiler vectorises.
+/// `f16 → f32` conversion cannot be vectorised, so keeping it out of the inner
+/// loop leaves a plain FMA chain the compiler vectorises.
 struct Mat {
     data: Vec<f32>,
     rows: usize,
@@ -59,20 +48,10 @@ impl Mat {
 
     /// Batched over `rows` input vectors: `out[r][o] = Σ_k w[o,k]·x[r,k]`.
     ///
-    /// Parallelised over **output rows** and accumulated in a transposed
-    /// scratch (`acc[o][r]`), for two reasons that both showed up as measured
-    /// slowdowns:
-    ///
-    /// * slicing by the batch leaves a decode step (batch 1) on a single core —
-    ///   355 ms/token before this;
-    /// * slicing by `(r, o)` makes every weight element be read once *per batch
-    ///   row*, so a 210-token prefill streamed 139 GB instead of 0.66 GB —
-    ///   5.5 s of prefill.
-    ///
-    /// With `o` outermost a weight row is streamed once (into registers/L1) and
-    /// reused across the whole batch, while the activation block — the small
-    /// tensor — is re-read from L2.  The f32 → f16 rounding happens once, as on
-    /// the GPU.
+    /// Parallelised over **output rows** and accumulated in a transposed scratch
+    /// (`acc[o][r]`), so a weight row is streamed once and reused across the
+    /// whole batch while the activation block — the small tensor — is re-read
+    /// from L2.  The f32 → f16 rounding happens once, as on the GPU.
     fn batch_dot(&self, x: &[f16], rows: usize, out: &mut [f16]) {
         debug_assert_eq!(x.len(), rows * self.cols);
         debug_assert_eq!(out.len(), rows * self.rows);
@@ -115,16 +94,14 @@ impl Mat {
 
     /// `acc[o][r] = Σ_k w[o,k]·x[r,k]`, parallel over blocks of `o`.
     ///
-    /// A block (not one row) per task: with one row the chunk is `rows` floats —
-    /// 840 bytes at a 210-token prefill — and rayon's per-chunk overhead swamps
-    /// the dot product itself.
+    /// A block (not one row) per task: with one row the chunk is only `rows`
+    /// floats and rayon's per-chunk overhead swamps the dot product itself.
     fn dot_transposed(&self, x: &[f16], rows: usize) -> Vec<f32> {
         const OB: usize = 64;
         let (n_out, cols) = (self.rows, self.cols);
         // Widen the activations **once per op**, not once per output element:
         // the inner loop runs `n_out` times, so leaving `f16 → f32` inside it
-        // repeats the (unvectorisable) conversion `n_out` times — measured as
-        // the dominant cost after the weights were already f32.
+        // repeats the (unvectorisable) conversion `n_out` times.
         let mut xs = vec![0.0f32; rows * cols];
         xs.par_chunks_mut(cols)
             .zip(x.par_chunks(cols))
@@ -141,11 +118,9 @@ impl Mat {
                 let w_row = &self.data[o * cols..(o + 1) * cols];
                 for (r, y) in orow.iter_mut().enumerate() {
                     let x_row = &xs[r * cols..(r + 1) * cols];
-                    // Four accumulators: a single `s` serialises the FMA chain
-                    // on its latency (~4 cycles), which measured 8x off this
-                    // machine's f32 throughput.  This changes the summation
-                    // order, which the CPU path is allowed to do — it is gated
-                    // on the transcript, not on bit-equality with the GPU.
+                    // Four accumulators: a single accumulator serialises the FMA
+                    // chain on its latency (~4 cycles).  This changes the
+                    // summation order, which the CPU path is allowed to do.
                     let mut a = [0.0f32; 4];
                     let quads = cols / 4;
                     for q in 0..quads {
@@ -226,11 +201,10 @@ pub struct CpuTextDecoder {
     cos: Vec<f32>,
     sin: Vec<f32>,
     /// `[layer][nkvh][max_seq][hd]` — the GPU caches hold f16; these hold the
-    /// **same** values already widened to f32, because both attention loops
-    /// read every cached element once per query row and a per-element
-    /// `f16 → f32` there is exactly the conversion-bound pathology that cost
-    /// 18 s of a 34 s prefill.  Every store goes through `f16::from_f32` first,
-    /// so the numbers are bit-identical to the GPU's caches.
+    /// **same** values already widened to f32, so the attention loops do not pay
+    /// a per-element `f16 → f32` once per query row.  Every store goes through
+    /// `f16::from_f32` first, so the numbers are bit-identical to the GPU's
+    /// caches.
     k_cache: Vec<f32>,
     v_cache: Vec<f32>,
     /// Milliseconds per phase (norm, projections, rope, attention, mlp) —
@@ -345,15 +319,12 @@ impl CpuTextDecoder {
         let _cur = (q0 + attn.len() / (nqh * hd)).min(self.max_seq);
 
         // The caches are already f32 (see the field docs), so no loop here
-        // converts anything per element: that conversion, once per key per query
-        // row, was 18 s of a 34 s prefill.
+        // converts anything per element.
         //
-        // One task per *row* (all heads), so the score/accumulator scratch is
-        // allocated once per row instead of once per (row, head).
-        // One task per *(row, head)*: a decode step has a single row, so
-        // grouping the heads into one task would run the whole scan on one core
-        // (measured 136 ms/token).  `map_init` gives each rayon worker its own
-        // scratch, so this does not allocate per task either.
+        // One task per *(row, head)*: a decode step has a single row, so grouping
+        // the heads into one task would run the whole scan on one core.
+        // `map_init` gives each rayon worker its own scratch, so this does not
+        // allocate per task either.
         let row_elems = nqh * hd;
         attn.par_chunks_mut(hd)
             .enumerate()
@@ -381,9 +352,8 @@ impl CpuTextDecoder {
                 let krow_all = &self.k_cache[kh_base..kh_base + valid * hd];
                 let vrow_all = &self.v_cache[kh_base..kh_base + valid * hd];
                 // Four accumulators per key row: a single `dot` serialises the
-                // FMA chain on ~4-cycle latency, and the decode scan (2307 keys
-                // x 128 dims per head) is latency-bound long before it is
-                // bandwidth-bound — measured 147 ms/token with one accumulator.
+                // FMA chain on ~4-cycle latency, and the decode scan is
+                // latency-bound long before it is bandwidth-bound.
                 let mut best = f32::NEG_INFINITY;
                 let quads = hd / 4;
                 for t in 0..valid {
@@ -455,8 +425,7 @@ impl CpuTextDecoder {
             }
             timings[0] += mark.elapsed().as_secs_f64() * 1000.0;
             mark = std::time::Instant::now();
-            // 2. q / k / v projections (separate matrices here; the GPU fuses
-            //    them into one GEMM, which changes nothing but the launch count)
+            // 2. q / k / v projections
             layer.q_proj.batch_dot(&normed, rows, &mut q);
             layer.k_proj.batch_dot(&normed, rows, &mut k);
             layer.v_proj.batch_dot(&normed, rows, &mut v);
@@ -592,9 +561,7 @@ impl CpuTextDecoder {
     ///
     /// The aligner reads its timestamps off *every* `<timestamp>` row, not just
     /// the last one, so it needs all `s` rows of `[s, hidden]` f16 — the same
-    /// thing the GPU decoder exposes as `debug_prefill_h`.  `prefill` is left
-    /// untouched: it is the path the ASR gate was verified on, and the layer
-    /// loop it shares (`forward`) is the same code either way.
+    /// data the GPU decoder exposes as `debug_prefill_h`.
     pub fn prefill_hidden(
         &mut self,
         hidden_words: &[u8],
@@ -641,8 +608,7 @@ impl CpuTextDecoder {
         Ok(tok)
     }
 
-    /// Tokens per second this decoder can be expected to reach — not measured,
-    /// just a shape sanity check used by the CLI.
+    /// Decoder shape summary, used by the CLI.
     pub fn describe(&self) -> String {
         format!(
             "cpu decoder: {} layers, hidden {}, {} heads ({} kv), max_seq {}, f16 weights",
@@ -672,11 +638,10 @@ fn widen_batch(x: &[f16], rows: usize, cols: usize) -> Vec<f32> {
 /// `out[r][o] = Σ_k x[r][k]·w[o][k]` (row-major throughout, `w` = `[n, k]`), via
 /// the `gemm` crate's microkernels with every core forced on.
 ///
-/// Two traps, both measured: the two scalars before the strides are
-/// **`(beta, alpha)`** (the crate's own test compares `gemm` against
-/// `gemm_fallback` through the same wrapper, so a swapped pair passes there),
-/// and the strides have to be verified at *production* shapes — small shapes
-/// take a non-packing path, so the unit test below runs both.
+/// Two traps: the two scalars before the strides are **`(beta, alpha)`** (a
+/// swapped pair is not caught by the crate's own test), and the strides have to
+/// be verified at *production* shapes — small shapes take a non-packing path, so
+/// the unit test below runs both.
 fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: usize, beta: f32) {
     debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(x.len(), m * k);
@@ -710,10 +675,10 @@ fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: 
 mod tests {
     use super::*;
 
-    /// Pin the `gemm` wrapper against a hand-written triple loop — at a toy
-    /// shape *and* the production ones, because the crate branches (packing,
-    /// threading thresholds) differently there and a stride that is right for
-    /// 3x5x4 was measured to produce garbage at 210x1280x1024.
+    /// Pin the `gemm` wrapper against a hand-written triple loop — at a toy shape
+    /// *and* the production ones, because the crate branches (packing, threading
+    /// thresholds) differently there, so a stride right for 3x5x4 can be wrong at
+    /// 210x1280x1024.
     #[test]
     fn gemm_row_major_matches_naive() {
         for &(m, n, k) in &[

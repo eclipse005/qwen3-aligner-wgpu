@@ -5,8 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrConfig {
     pub thinker_config: ThinkerConfig,
-    /// Present on forced-aligner checkpoints.  The base model is the same
-    /// `Qwen3ASRForTokenClassification`; this is the timestamp head's geometry.
+    /// Present on forced-aligner checkpoints: the timestamp head's geometry.
     #[serde(skip)]
     pub align: Option<AlignHeadConfig>,
     /// The languages this checkpoint declares, as written in `config.json`.
@@ -415,7 +414,7 @@ mod tests {
         assert_eq!(cfg.thinker_config.audio_start_token_id, 151669);
         assert_eq!(cfg.thinker_config.audio_end_token_id, 151670);
 
-        // Audio tower: the *0.6B* geometry, not the ASR 0.6B's 896/18/14.
+        // Audio tower geometry.
         let au = &cfg.thinker_config.audio_config;
         assert_eq!(au.d_model, 1024);
         assert_eq!(au.encoder_layers, 24);
@@ -427,7 +426,7 @@ mod tests {
         assert_eq!(au.n_window_infer, 800);
         assert_eq!(au.output_dim, 1024);
 
-        // Text tower: qwen3, and the -hf config has no mrope_section at all.
+        // Text tower; the -hf config declares no mrope_section.
         let t = &cfg.thinker_config.text_config;
         assert_eq!(t.hidden_size, 1024);
         assert_eq!(t.num_hidden_layers, 28);
@@ -438,7 +437,6 @@ mod tests {
         assert_eq!(t.rope_theta, 1_000_000.0);
         assert!(t.rope_scaling.is_none());
 
-        // …which is exactly why `mrope_section()`'s default must not be trusted.
         let rope = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rope).unwrap();
         assert!(

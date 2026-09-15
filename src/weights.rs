@@ -1,15 +1,9 @@
 //! Model weight loading for the wgpu engine.
 //!
-//! Deliberately independent of the main crate: `weights` / `raw_tensor` are
-//! private modules there, and the brief keeps all wgpu code inside this crate.
-//! The **bytes are produced by exactly the same conversion path** the CUDA
-//! backend uses (bf16 -> f32 via a 16-bit shift -> `half::f16::from_f32`), so the
-//! two engines consume bit-identical f16 weights.
+//! Tensors are converted to f16 (bf16 via a 16-bit shift to f32, then
+//! `half::f16::from_f32`) and uploaded in the layouts the kernels want:
 //!
-//! Tensors are uploaded in the layouts the kernels want:
-//!
-//! * fused QKV = `[q_proj | k_proj | v_proj]` rows concatenated (same as
-//!   `load_fused_qkv_weight`);
+//! * fused QKV = `[q_proj | k_proj | v_proj]` rows concatenated;
 //! * fused gate/up = `[gate_proj | up_proj]` rows concatenated;
 //! * everything stored f16, byte-packed.
 
@@ -31,7 +25,7 @@ pub struct RawTensor {
 }
 
 impl RawTensor {
-    /// bf16/f16/f32 -> f16, matching `qwen3-asr`'s `RawTensor::to_f16_vec`.
+    /// Convert bf16/f16/f32 to f16.
     pub fn to_f16_vec(&self) -> Result<Vec<half::f16>> {
         Ok(match self.dtype {
             Dtype::F16 => self
@@ -93,10 +87,8 @@ impl RawTensor {
     /// the byte layout the decoder's `prefill` takes.
     ///
     /// An f16 tensor is a straight `memcpy` out of the mapped file; any other
-    /// dtype is converted element-wise.  Use this for token lookups instead of
-    /// [`Self::to_f16_vec`], which materialises the *whole* table on every call:
-    /// `embed_tokens` is 155 M elements at 0.6 B and twice that at 1.7 B, i.e.
-    /// ~0.3 s / ~0.6 s of allocation and conversion per transcription.
+    /// dtype is converted element-wise.  Unlike [`Self::to_f16_vec`] this does
+    /// not materialise the whole table.
     pub fn append_f16_row_le(&self, row: usize, cols: usize, out: &mut Vec<u8>) -> Result<()> {
         anyhow::ensure!(self.shape.len() >= 1 && cols == *self.shape.last().unwrap(), "row cols {cols} != {:?}", self.shape);
         let stride = cols * 2;
@@ -125,7 +117,7 @@ impl RawTensor {
     }
 }
 
-/// mmap every safetensors shard, zero-copy, mirroring `weights.rs`.
+/// mmap every safetensors shard, zero-copy.
 pub fn load_tensors(model_dir: &Path) -> Result<HashMap<String, RawTensor>> {
     let index = model_dir.join("model.safetensors.index.json");
     if index.exists() {

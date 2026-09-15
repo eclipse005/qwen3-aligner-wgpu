@@ -5,18 +5,19 @@ pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
 pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 
-/// Log-mel for the aligner: 128 bins, 16 kHz, torch-STFT compatible.
+/// Log-mel for the aligner: 16 kHz, `n_fft` 400, hop 160, 128 slaney bins,
+/// `log10` clamped to `max - 8` then `(x + 4) / 4` (`librosa`-compatible).
 ///
 /// Returns `(mel, num_mel_bins, valid_frames)`, row-major `[bins, frames]`.  The
 /// caller still has to right-pad the time axis to a multiple of `n_window * 2`
-/// with `0.0` — see `align_input::padded_mel_frames` — because that padding is a
+/// with `0.0` (see `align_input::padded_mel_frames`) — that padding is a
 /// processor-level step, not part of the STFT.
 pub fn mel_features(samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
     MelExtractor::new(N_FFT, HOP_LENGTH, 128, MEL_SAMPLE_RATE).extract(samples)
 }
 
 fn hann_window(n: usize) -> Vec<f32> {
-    // Match torch.hann_window(n, periodic=True) used by Qwen3ASRFeatureExtractor.
+    // Periodic Hann window: 0.5 * (1 - cos(2*pi*i/n)).
     (0..n)
         .map(|i| {
             let x = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
@@ -25,7 +26,8 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// numpy/torch `mode="reflect"` (edge not repeated). `n==0` is empty.
+/// Reflection index with the edge not repeated (`mode="reflect"`). `n <= 1`
+/// returns 0.
 fn reflect_index(i: isize, n: usize) -> usize {
     if n <= 1 {
         return 0;
@@ -195,7 +197,7 @@ impl MelExtractor {
 
     pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
         anyhow::ensure!(!samples.is_empty(), "empty audio");
-        // torch.stft(center=True): reflect-pad n_fft/2, then drop the extra frame.
+        // Centered STFT: reflect-pad n_fft/2, then drop the trailing frame.
         let pad = self.n_fft / 2;
         let padded_signal = reflection_pad(samples, pad);
 
@@ -439,13 +441,8 @@ pub fn load_audio_wav(path: impl AsRef<std::path::Path>, target_sr: u32) -> anyh
     load_audio_wav_impl(path.as_ref(), target_sr)
 }
 
-/// Read a plain 16-bit PCM wav straight out of the data chunk.
-///
-/// `hound`'s `into_samples` is a per-sample iterator: 7.8 M `Result` unwraps and
-/// `push`es for the 176 s fixture.  Decoding the bytes in place is the same
-/// arithmetic (`i16 as f32 / 32768.0`, exactly what the iterator path does with
-/// `max_val = 1 << 15`) at a fraction of the cost, so this is a free win with no
-/// numerical consequence.
+/// Read a plain 16-bit PCM wav straight out of the data chunk, decoding samples
+/// in place as `i16 as f32 / 32768.0`.
 ///
 /// Returns `None` for anything that is not mono-able 16-bit PCM — float formats,
 /// other bit depths, extensible headers — and the caller falls back to `hound`.
@@ -511,9 +508,7 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
     let channels = spec.channels as usize;
     let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
 
-    // A data chunk shorter than the header promises is not fatal: libsndfile and
-    // ffmpeg play what is there, and one FLEURS test wav ships that way (its
-    // `data` chunk claims 151492 bytes, the file holds 147398).  Keep the
+    // A data chunk shorter than the header promises is not fatal: keep the
     // samples that could be read rather than failing the whole clip.
     let mut truncated = false;
     let mut samples_f32: Vec<f32> = Vec::new();
@@ -575,11 +570,9 @@ fn finish_audio(mono: Vec<f32>, sr: u32, target_sr: u32) -> anyhow::Result<Vec<f
 mod fast_reader_tests {
     use super::*;
 
-    /// The fast PCM16 reader must agree with `hound` **bit for bit**, on every
-    /// fixture, at every sample rate and channel count the suite covers.  A
-    /// one-ULP difference here would propagate through soxr into the mel and out
-    /// the other end as a moved timestamp, which is exactly the class of change
-    /// this port refuses to make.
+    /// The fast PCM16 reader must agree with `hound` **bit for bit**: a one-ULP
+    /// difference would propagate through soxr into the mel and out as a moved
+    /// timestamp.
     #[test]
     fn fast_pcm16_equals_hound_for_every_fixture() {
         let dir = crate::gold::fixtures_dir();
@@ -630,10 +623,9 @@ mod fast_reader_tests {
     }
 }
 
-/// Match Transformers `load_audio` → librosa (`soxr_hq`).
-///
-/// librosa.resample runs soxr HQ then `fix_length` to `ceil(n * target / orig)`.
-/// `soxr_oneshot` defaults to LQ — quality must be passed explicitly.
+/// Resample with soxr HQ, `librosa`-style: soxr then `fix_length` to
+/// `ceil(n * target / orig)`.  `soxr_oneshot` defaults to LQ, so the quality
+/// must be passed explicitly.
 fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f32>> {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_uint, c_ulong, c_void};
@@ -698,10 +690,8 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
     // librosa.resample(..., fix=True) uses ceil, not trunc/round.
     let expected = (mono.len() as f64 * target_sr as f64 / sr as f64).ceil() as usize;
     let q = unsafe { soxr_quality_spec(SOXR_HQ, 0) };
-    // One thread on purpose: soxr's OpenMP path only splits work across
-    // *channels* (`num_channels > 1` in `soxr.c`), and this is mono, so a thread
-    // pool buys nothing.  Measured: 1 vs 8 threads, same 1.3 s and byte-identical
-    // output for a 3-minute 44.1 kHz clip.
+    // One thread: soxr's OpenMP path only splits work across *channels*, and this
+    // is mono, so a thread pool buys nothing.
     let rt = unsafe { soxr_runtime_spec(1) };
     let mut err: SoxrErrorT = std::ptr::null();
     let soxr = unsafe {

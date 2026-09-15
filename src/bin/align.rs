@@ -533,7 +533,7 @@ OPTIONS:
 
 NOTE:
   The aligner always stores f16 and accumulates in f32, so --dtype is a gate-time
-  choice, not a compute knob.  fp32 is the default because the reference's CPU
-  and CUDA runs agree exactly at fp32, and both disagree with fp16 at a handful
-  of near-tie positions.
+  choice, not a compute knob.  fp32 is the default because the reference agrees
+  with itself exactly at fp32, and disagrees with fp16 at a handful of near-tie
+  positions.
 ";

@@ -1,17 +1,16 @@
-//! MRoPE (multi-axis RoPE) cos/sin tables — self-contained.
+//! MRoPE (multi-axis RoPE) cos/sin tables.
 //!
 //! The text decoder rotates `head_dim`-wide rows where the *first half* of the
 //! frequency index space is split across three position axes (temporal / height /
 //! width for multimodal input, all three equal for pure text) according to
 //! `mrope_section`, and the second half duplicates the first.
 //!
-//! Everything is computed in f64 and rounded to f32 once, exactly like the
-//! reference implementation, so the resulting table is bit-identical.
+//! Everything is computed in f64 and rounded to f32 once.
 
 /// Expand `section` (one quota per axis) into a per-frequency axis index.
 ///
-/// `interleaved` picks the Qwen2-VL layout (`0,1,2,0,1,2,…` while quotas last)
-/// versus the blocked layout (all of axis 0, then all of axis 1, …).
+/// `interleaved` picks the `0,1,2,0,1,2,…` layout (while quotas last) versus the
+/// blocked layout (all of axis 0, then all of axis 1, …).
 pub fn build_dim_map(section: &[usize], half: usize, interleaved: bool) -> Vec<usize> {
     if interleaved {
         let nd = section.len();

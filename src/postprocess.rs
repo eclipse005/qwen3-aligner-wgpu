@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_matches_the_upstream_layout() {
+    fn pairing_follows_the_documented_layout() {
         let words: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let items = decode_timestamps(&words, &[2000, 2080, 2080, 2240]).unwrap();
         assert_eq!(

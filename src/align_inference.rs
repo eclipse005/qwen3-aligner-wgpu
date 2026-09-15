@@ -305,10 +305,8 @@ impl Aligner {
         self.align_samples(&samples, text, language)
     }
 
-    /// As [`Self::align_with_raw`], for audio the caller already decoded.
-    ///
-    /// `samples` must be mono 16 kHz — the same contract as
-    /// `AudioInput::Waveform16Khz` in the CUDA API.
+    /// As [`Self::align_with_raw`], for audio the caller already decoded:
+    /// mono 16 kHz, in [-1, 1].
     pub fn align_samples(
         &mut self,
         samples: &[f32],

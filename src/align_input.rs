@@ -9,10 +9,10 @@
 //! w0 [151705][151705] w1 [151705][151705] ...  2 timestamps per word
 //! ```
 //!
-//! **No BOS, no EOS, no chat template.**  The upstream wrapper builds this string
-//! by hand and hands it to the processor, which only expands the single
-//! `<|audio_pad|>` into `N` copies ("replace_audio_token").  For `15s_en`:
-//! `323 = 1 + 195 + 1 + 78 + 47`, i.e. the 39 words cost 47 BPE tokens — one
+//! **No BOS, no EOS, no chat template.**  The sequence is built by concatenating
+//! the markers and the words directly, and the only expansion is
+//! `<|audio_pad|>` into `n_audio_tokens` copies.  For `15s_en`:
+//! `323 = 1 + 195 + 1 + 78 + 48`, i.e. the 39 words cost 48 BPE tokens — one
 //! word is *not* one token, and only the `<timestamp>` count is tied to the word
 //! count.
 //!
@@ -80,8 +80,8 @@ pub fn padded_mel_frames(valid_mel_frames: usize, n_window: usize) -> usize {
 
 /// Valid mel frames from a sample count: `floor(n_samples / hop)`.
 ///
-/// `torch.stft(center=True)` yields `1 + floor(n_samples / hop)` frames and the
-/// feature extractor drops the last (`stft[..., :-1]`).
+/// A centered STFT yields `1 + floor(n_samples / hop)` frames and the feature
+/// extractor drops the last one.
 pub fn valid_mel_frames(n_samples: usize) -> usize {
     n_samples / HOP_LENGTH
 }

@@ -1,20 +1,12 @@
-// Lifted from the ASR port `D:\qwen3-asr-wgpu` verbatim, including the staged
-// entry points (`run_conv_stem`, `run_transformer`, …) that its `--cpu` profiling
-// binaries drove and this crate does not.  They are kept rather than pruned so
-// the file stays a faithful copy of the verified original; the alternative is a
-// fork that has to be re-diffed on every future lift.
 #![allow(dead_code)]
 
-//! CPU audio encoder for Qwen3-ASR — f32 GEMM (`gemm` crate + rayon).
-//! Safetensors weights are f16; converted once at load.
+//! CPU audio encoder for Qwen3-ASR — f32 GEMM (`gemm` crate + rayon), weights
+//! converted from f16 once at load.  Architecture:
 //!
-//! Architecture:
 //!   mel [T_mel, 128]  →  conv2d stem (3 × {im2col + gemm + bias + GELU})
 //!   → conv_out (Linear + bias)  →  + sinusoidal PE
 //!   → 18 × { LN + windowed attn + LN + FFN(GELU-erf) }
-//!   → ln_post + proj1 + GELU + proj2
-//!   → [n_total, output_dim]
-//!
+//!   → ln_post + proj1 + GELU + proj2  → [n_total, output_dim]
 use anyhow::Result;
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
@@ -27,9 +19,8 @@ use crate::weights::RawTensor;
 
 // ─── Phase profiling (QWEN3_ENC_PROFILE=1) ─────────────────────────
 //
-// The encoder's wall time is dominated by a handful of ops whose split the
-// end-to-end timer cannot show.  Buckets are filled only when the env var is
-// set (`profiling()`), so the hot path pays one relaxed bool load per bucket.
+// Buckets are filled only when `QWEN3_ENC_PROFILE` is set (`profiling()`), so
+// the hot path pays one relaxed bool load per bucket.
 
 static PROF_NS: [AtomicU64; 16] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
@@ -200,7 +191,7 @@ impl CpuAudioLayerNorm {
     }
 }
 
-/// Match `torch.nn.functional.gelu` / `ACT2FN["gelu"]` (erf, not tanh).
+/// GELU, erf form (not tanh).
 #[inline]
 fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2))
@@ -211,9 +202,8 @@ pub(crate) fn gelu_inplace(x: &mut CpuTensor) {
 }
 
 /// Standard im2col for conv2d(kernel=3, stride=2, pad=1).
-/// Input x: [b, c_in, h, w].
-/// Output: [col_count, c_in*9] row-major, where col_count = b * h_out * w_out.
-/// Column layout: col[ic*9 + kh*3 + kw] matches weight [c_out, c_in, 3, 3] flattened.
+/// Input x: [b, c_in, h, w]; output `[b*h_out*w_out, c_in*9]` row-major, with
+/// `col[ic*9 + kh*3 + kw]` matching weight `[c_out, c_in, 3, 3]` flattened.
 pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
     let h_out = (h + 2 - 3) / 2 + 1;
     let w_out = (w + 2 - 3) / 2 + 1;
@@ -270,7 +260,7 @@ impl CpuConvStem {
         let c3_b = load_bias(weights, &format!("{}.conv2d3.bias", prefix))?;
         let co = CpuAudioLinear::load(weights, &format!("{}.conv_out", prefix))?;
 
-        // Sinusoidal PE — formula identical to `gpu_audio_encoder.rs:220-228`.
+        // Sinusoidal PE: sin in the first half of the channels, cos in the rest.
         let dm = config.d_model;
         let max_pos = config.max_source_positions;
         let half = dm / 2;
@@ -286,9 +276,8 @@ impl CpuConvStem {
         Ok(Self { c1_w, c1_b, c2_w, c2_b, c3_w, c3_b, co, pe, d_model: dm, max_pos })
     }
 
-    /// Run conv stem on chunked mel input.
-    /// mel_chunks: [b_chunks * n_mels * cs] in (chunk, mel_bin, frame) order.
-    /// Layout matches GPU: [b_chunks, c=1, h=n_mels, w=cs] in NCHW.
+    /// Run conv stem on chunked mel input, NCHW `[b_chunks, 1, n_mels, cs]`,
+    /// flat `[b_chunks * n_mels * cs]` in (chunk, mel_bin, frame) order.
     /// Returns ([b_chunks * t2 * d_model], t2).
     pub(crate) fn forward(
         &self,
@@ -301,9 +290,8 @@ impl CpuConvStem {
         Ok((out, t2))
     }
 
-    /// As [`Self::forward`], also returning the `conv_out` *operand* — the
-    /// permuted `[chunk·t2][c·f]` rows — so the GPU's `packed` can be compared
-    /// without going through the projection.
+    /// As [`Self::forward`], also returning the `conv_out` operand — the permuted
+    /// `[chunk·t2][c·f]` rows — without going through the projection.
     pub(crate) fn forward_stages(
         &self,
         mel_chunks: &[f32],
@@ -380,17 +368,10 @@ impl CpuConvStem {
         Ok((act, ho, wo))
     }
 
-    /// As [`Self::conv_block`], but returning the two tensors the GPU tower
-    /// keeps on separate buffers, **in the GPU's own layouts** so a comparison
-    /// cannot mix the axes up:
-    ///
-    /// * `raw` — the GEMM output `[c_out][n_chunks·plane]` *before* bias+GELU
-    ///   (`enc.cN_raw`): channel-major, every chunk's positions flattened;
-    /// * `act` — the same, *after* bias+GELU (`enc.cN_act`);
-    /// * `cols` — the im2col operand `[n_chunks·plane][k]`, `k = ic·9 + kh·3 + kw`
-    ///   (`enc.cN_col`, which stores its transpose).
-    ///
-    /// The tile loop is kept: `conv2`'s full-batch im2col is ~GB.
+    /// As [`Self::conv_block`], also returning `raw` (the GEMM output
+    /// `[c_out][n_chunks·plane]`, channel-major, pre-bias/GELU), `act` (the same,
+    /// post-bias/GELU) and `cols` (the im2col operand `[n_chunks·plane][k]`,
+    /// `k = ic·9 + kh·3 + kw`).
     #[allow(clippy::type_complexity)]
     pub(crate) fn conv_block_stages(
         &self,
@@ -407,12 +388,10 @@ impl CpuConvStem {
         assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
         let plane = h_out * w_out;
         let in_plane = c_in * h * w;
-        // `raw` is only materialised for the diagnostic: at 180 s it is 1 GiB
-        // (c_out · chunks · plane · 4 B), and the production path does not read
-        // it at all — it would be allocated and written for nothing.
+        // `raw` is materialised only for the diagnostic path.
         let mut raw = if want_raw { vec![0.0f32; c_out * b * plane] } else { Vec::new() };
         let mut act = vec![0.0f32; b * c_out * plane];
-        // Tile batch so conv2/conv3 im2col stays cache-sized (full-b c2 is ~GB).
+        // Tile the batch so conv2/conv3's im2col stays cache-sized.
         let tile = CONV_TILE.load(Ordering::Relaxed).max(1) as usize;
         for b0 in (0..b).step_by(tile) {
             let nb = tile.min(b - b0);
@@ -424,10 +403,9 @@ impl CpuConvStem {
             prof_add(P_IM2COL, _t);
             debug_assert_eq!((ho, wo), (h_out, w_out));
             let col_count = nb * plane;
-            // When `want_raw`, the GEMM writes straight into `raw`, which is
-            // laid out `[c_out][b·plane]` — the GEMM's own layout and exactly
-            // the GPU's channel-major form.  Otherwise it uses a tile-sized
-            // scratch, as the production path always did.
+            // When `want_raw`, the GEMM writes straight into `raw`, laid out
+            // `[c_out][b·plane]` (channel-major); otherwise it uses a tile-sized
+            // scratch.
             let mut scratch = vec![0.0f32; if want_raw { 0 } else { c_out * col_count }];
             let (out_ptr, cstride) = if want_raw {
                 (unsafe { raw.as_mut_ptr().add(b0 * plane) }, (b * plane) as isize)
@@ -455,10 +433,8 @@ impl CpuConvStem {
                 let ib = plane_idx / c_out;
                 let oc = plane_idx % c_out;
                 let bias = w_b[oc];
-                // The `want_raw` source is the *whole* `[c_out][b·plane]` tensor, so
-                // this tile's chunk is `b0 + ib`; reading `ib` fed the epilogue the
-                // first tile's rows for every later tile.  Invisible at one tile,
-                // which is why the single-chunk diagnostics agreed and this did not.
+                // The `want_raw` source is the whole `[c_out][b·plane]` tensor,
+                // so this tile's chunk is `b0 + ib`.
                 let src_chunk = if want_raw { b0 + ib } else { ib };
                 let src_row = oc * src_row_stride + src_chunk * plane;
                 for i in 0..plane {
@@ -471,9 +447,8 @@ impl CpuConvStem {
     }
 }
 
-/// Batch tile used by `conv_block` for the im2col buffer.  Exposed so the probe
-/// binaries can sweep it (the buffer is `TILE * h_out * w_out * c_in * 9` f32 —
-/// 7.5 MB at TILE=8 for conv2, so it is a real cache/alloc factor).
+/// Batch tile used by `conv_block` for the im2col buffer: `TILE * h_out * w_out
+/// * c_in * 9` f32 elements.
 pub static CONV_TILE: AtomicU64 = AtomicU64::new(8);
 
 fn load_conv_weight(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeightF16> {
@@ -515,11 +490,8 @@ impl CpuAudioAttention {
         })
     }
 
-    /// Windowed attention, flattened to `[b, s, nh·hd]` — everything `forward`
-    /// does *before* `out_proj`, which is the layout the GPU's `enc.attn_flat`
-    /// holds.  Comparing the GPU's flattened block against `forward` (i.e.
-    /// against the *projected* output) is an off-by-one-stage comparison that
-    /// can never pass.
+    /// Windowed attention flattened to `[b, s, nh·hd]` — everything `forward`
+    /// does before `out_proj`.
     pub(crate) fn flat(
         &self,
         x: &CpuTensor,
@@ -717,14 +689,14 @@ impl CpuAudioLayer {
     }
 }
 
-/// Replicate of `gpu_audio_encoder.rs::feo` (line 389-392).
+/// `f` folded three times: the token count a chunk of `ifr` frames produces.
 pub fn feo(ifr: usize) -> usize {
     let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
     f(f(f(ifr)))
 }
 
-/// One conv level's CPU tensors, in the GPU tower's own layouts (minus the
-/// GPU's padding), so a stage comparison indexes both sides the same way.
+/// One conv level's tensors, in the GPU tower's layouts minus its padding, so a
+/// stage comparison indexes both sides the same way.
 pub struct CpuConvStage {
     /// GEMM output `[c_out][n_chunks·plane]`, pre-bias/GELU (`enc.cN_raw`).
     pub raw: Vec<f32>,
@@ -918,7 +890,7 @@ impl CpuAudioEncoder {
         &self.config
     }
 
-    /// Conv-stem geometry probe: `(c1_out, h1, w1, c2_out, h2, w2, c3_out, h3, w3)`
+    /// Conv-stem geometry: `(c1_out, h1, w1, c2_out, h2, w2, c3_out, h3, w3)`
     /// for one full chunk of `n_window * 2` mel frames over `n_mels` bins.
     /// The GPU tower must reproduce exactly these numbers.
     pub fn conv_geometry(&self, n_mels: usize) -> Result<[usize; 9]> {
@@ -941,13 +913,10 @@ impl CpuAudioEncoder {
         ])
     }
 
-    /// CPU reference for the GPU tower's conv stem.
-    ///
-    /// Returns `(c1_raw, c1_shape, packed, packed_shape)`:
-    /// * `c1_raw` in the GPU's own layout — `[chunk][c_out][pos]` flattened,
-    ///   i.e. exactly what `enc.c1_act` holds before bias+GELU;
-    /// * `packed` — the conv-stem output that feeds the transformer, so a
-    ///   mismatch can be split into "conv stem" versus "attention stack".
+    /// CPU check for the GPU tower's conv stem, returning
+    /// `(c1_raw, c1_shape, packed, packed_shape)`: `c1_raw` in the GPU's
+    /// `[chunk][c_out][pos]` layout before bias+GELU, and `packed`, the conv-stem
+    /// output that feeds the transformer.
     pub fn conv_reference(
         &self,
         mel: &[f32],
@@ -1022,9 +991,8 @@ impl CpuAudioEncoder {
         Ok((x1, self.conv_stem.c1_w.rows, h1 * w1, n_chunks))
     }
 
-        /// Run the conv stem stage by stage, returning each level's operand, raw
-    /// GEMM output and post-GELU activation in the GPU's layouts — the oracle
-    /// for `WgpuAsr::diagnose_encoder_mel`.
+    /// Run the conv stem stage by stage, returning each level's operand, raw GEMM
+    /// output and post-GELU activation in the GPU's layouts (diagnostic oracle).
     pub fn conv_tower(&self, mel: &[f32], n_mels: usize, n_frames: usize) -> Result<CpuConvTower> {
         let (chunked, cs, tpc, nfull, tail, n_chunks, n_total) =
             self.chunk_mel(mel, n_mels, n_frames)?;
@@ -1074,16 +1042,12 @@ impl CpuAudioEncoder {
         Ok(CpuConvTower { stages, packed, h: hh, n_total, n_chunks })
     }
 
-    /// One level's conv stages from an **explicit** input.
+    /// One level's conv stages from an explicit input, so each level is a
+    /// bit-for-bit comparison rather than a chained one that carries f16 rounding
+    /// into deeper levels.
     ///
-    /// `conv_tower` chains the levels through the CPU's own f32 activations; the
-    /// GPU's are f16, so a chained comparison carries that rounding into every
-    /// deeper level and hides real bugs under it.  Handing the CPU exactly the
-    /// tensor the GPU consumed makes each level a bit-for-bit comparison.
-    ///
-    /// `x` is `[n_chunks][c_in][h][w]` flattened, in either the mel's
-    /// `[mel_bin][frame]` form (`c_in == 1`) or an activation's channel-major
-    /// form — the same thing the GPU's gather reads.
+    /// `x` is `[n_chunks][c_in][h][w]` flattened, in the mel's `[mel_bin][frame]`
+    /// form (`c_in == 1`) or an activation's channel-major form.
     pub fn conv_stages_from(
         &self,
         level: usize,

@@ -7,10 +7,10 @@
 //! values (`fixed_ms`).
 //!
 //! Gold lives under a **dtype subdirectory** — `f16/`, `bf16/`, `fp32/` — because
-//! the reference is dtype-dependent: it is whatever `torch_dtype` the caller
-//! passes, and the 5000-way argmax moves by one 80 ms bucket on a handful of
-//! words between them.  A port picks the directory matching the precision it
-//! computes in (`--dtype auto` on a bf16-capable device, `f16` otherwise).
+//! the reference is dtype-dependent: it computes at whatever precision the caller
+//! asks for, and the 5000-way argmax moves by one 80 ms bucket on a handful of
+//! words between them.  A run is compared against the directory matching the
+//! precision it computes in.
 //!
 //! What is **not** dtype-dependent, and is therefore the hard gate: the word
 //! sequence, the line count, ordering, and the fact that both endpoints of every
@@ -28,12 +28,12 @@ pub const TIMESTAMP_SEGMENT_MS: i64 = 80;
 
 /// Below this top-1/top-2 logit gap the reference's own answer is not stable.
 ///
-/// Measured, not chosen: every divergence this port has ever produced sits at a
-/// position with a margin at or under 0.00781, and the reference disagrees with
-/// *itself* at those positions — `180s_en` index 253 is chosen differently by
-/// CUDA-fp16 than by CUDA-fp32, CPU-fp32 and CPU-fp16 (whose margin there is
-/// exactly 0.00000).  The next-lowest margins in that clip are 0.0098 and up, so
-/// 0.01 separates "the model decided" from "rounding decided".
+/// Measured, not chosen: every divergence this implementation has produced sits
+/// at a position with a margin at or under 0.00781, and at those positions the
+/// reference disagrees with *itself* — one bucket is selected differently
+/// depending on the precision it is run at, and at `180s_en` index 253 the gap
+/// is exactly 0.00000.  The next-lowest margins in that clip are 0.0098 and up,
+/// so 0.01 separates "the model decided" from "rounding decided".
 pub const MARGIN_NOISE_FLOOR: f32 = 0.01;
 
 /// How a run's timestamp stream compares, split by whether the reference was

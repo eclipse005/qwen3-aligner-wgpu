@@ -20,14 +20,14 @@
 //! transcript is split, how the sequence is assembled, and how the model's
 //! timestamps are repaired and paired.
 //!
-//! The infrastructure — [`gpu`], [`mel`], [`weights`], the shaders and the two
-//! towers — is lifted from the sibling ASR port (`D:\qwen3-asr-wgpu`), which is
-//! model-independent and was verified there.
+//! [`gpu`], [`mel`] and [`weights`] are device plumbing, the log-mel front end
+//! and checkpoint access; [`shaders`], [`decoder`] and the two audio encoders
+//! are the model's two towers.
 //!
-//! Gated against `transformers`' native `Qwen3ASRForTokenClassification` on the
-//! **`-hf`** checkpoint (`model.audio_tower.*` / `score.weight`), not the
-//! original-layout one.  Baselines are in `tools/gold/`; `src/gold.rs` records
-//! why the timestamp criterion is a margin rather than a tolerance.
+//! Runs against the **`-hf`** checkpoint (`model.audio_tower.*` /
+//! `score.weight`); the original-layout one stores different tensor names.
+//! Baselines are in `tools/gold/`; `src/gold.rs` records why the timestamp
+//! criterion is a margin rather than a tolerance.
 
 pub mod align_inference;
 pub mod align_input;

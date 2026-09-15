@@ -1,12 +1,6 @@
-// Lifted from the ASR port `D:\qwen3-asr-wgpu` verbatim.  A few of its geometry
-// fields and helpers are read only by that project's probe binaries, which this
-// crate did not take; they are kept so the file remains a faithful copy of the
-// verified original rather than a fork to re-diff on the next lift.
 #![allow(dead_code)]
 
-//! GPU audio encoder for Qwen3-ASR — wgpu port of the CUDA audio tower.
-//!
-//! Architecture (identical math to [`crate::audio_encoder`], the CPU reference):
+//! GPU audio encoder for Qwen3-ASR.
 //!
 //! ```text
 //! mel [128, frames]  →  chunk to [chunks, 1, 128, 100]
@@ -16,30 +10,14 @@
 //!   → ln_post + proj1 + GELU + proj2  → [n_total, 1024]
 //! ```
 //!
-//! Design notes that matter for correctness and speed:
-//!
-//! * **im2col is a gather driven by a precomputed tap table** (see
-//!   [`shaders::audio_im2col`]) — no divisions or boundary tests in the inner
-//!   loop, coalesced column stores.
-//! * **Every GEMM is the text decoder's `prefill_gemm`** (64×64×16, f16
-//!   operands, f32 accumulate, `pack2x16float` epilogue), so the audio tower
-//!   does not invent a second accumulation order.
-//! * **Attention is windowed, not causal.**  Each of the `ceil(s/wlen)` windows
-//!   is an independent full attention over `wlen` tokens
-//!   (`wlen = feo(100)·n_window_infer/100` = 104 at the shipped config, padded to
-//!   the GEMM tile `wpad = align(wlen, 128)`).  `audio_win_pack` re-packs Q/K/V
-//!   into one dense block per `(head, window)`, `z = head·n_win + win`
-//!   ([`shaders::audio_win_pack`]), and the two batched GEMMs index those blocks
-//!   with `wid.z` — see [`shaders::prefill_gemm`] for the batch-stride units.
-//! * Conv planes are **width-padded to an even stride** (`w → w+1`) so the
-//!   im2col's packed-pair read always lands in bounds; the pad column lives only
-//!   in the tap table, never in the GEMM's `k` axis.
-//! * Weights stay f16 (the checkpoint dtype); activations are f16 with f32
-//!   accumulation, exactly like `WgpuTextDecoder::prefill`.
-//!
-//! This is the default tower (`transcribe` uses it unless `--cpu-enc` is given);
-//! `--compare-enc` cross-checks the embedding tensor against the CPU reference,
-//! and `--diag-enc` compares every stage of it.
+//! The mel is a single-channel `[128, frames]` image chunked into 100-frame
+//! pieces; three `k=3, s=2, p=1` convs take it `(128,100) → (480,64,50) →
+//! (480,32,25) → (480,16,13)`.  `conv_out` reads `(channel, freq)` as
+//! `c·freq_bins + f`, not the other way round.  Attention is windowed, not
+//! causal and not global: each `ceil(s/wlen)` window is an independent full
+//! attention over `wlen = feo(100)·n_window_infer/100` tokens.  The norms are
+//! LayerNorm with `eps = 1e-5`, not RMSNorm; conv planes are width-padded to an
+//! even stride.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,44 +31,30 @@ use crate::gpu::{BulkUpload, Gpu};
 use crate::shaders;
 use crate::weights::{self, PackedWeight, RawTensor};
 
-/// Tile edges of `shaders::prefill_gemm`, taken **from the kernel's own
-/// constants** rather than re-typed here.
-///
-/// These used to be hard-coded `64`, while the kernel's tiles are 128 wide
-/// (`bm = 16 * tm`).  Nothing failed loudly: the dispatch grids and buffer pads
-/// were derived from the wrong number, so half of each axis was simply never
-/// computed.  Importing them makes that drift impossible.
+/// Tile edges of `shaders::prefill_gemm`, imported from the kernel's own
+/// constants so the dispatch grids and buffer pads stay in sync with it.
 const GEMM_BM: usize = shaders::PREFILL_GEMM_BM;
 const GEMM_BN: usize = shaders::PREFILL_GEMM_BN;
 const GEMM_BK: usize = shaders::PREFILL_GEMM_BK;
 /// Conv taps: `3×3`, always one whole k-group of 16 per input channel.
 const TAPS: usize = 9;
-/// Token capacity of the preallocated pipeline (~22 min of audio at 12.5 tok/s).
+/// Token capacity of the preallocated pipeline (~22 min of audio).
 const MAX_TOKENS: usize = 16384;
-/// Largest attention window: `feo(100) · n_window_infer/100` = 1250 shipped.
+/// Largest attention window: `feo(100) · n_window_infer/100` = 1250.
 const MAX_WINDOW: usize = 2048;
 /// Uniform ring for per-dispatch `GDims` (256 B slots, dynamic offset).
-/// Capped at 256 slots = 64 KiB, which is `max_uniform_buffer_binding_size`
-/// on this stack (the text decoder's prefill ring uses the same budget).
+/// 256 slots = 64 KiB, this stack's `max_uniform_buffer_binding_size`.
 const MAX_GEMMS: usize = 256;
-/// Chunks processed per conv-stem round.
-///
-/// The conv is chunk-independent, but the *operands* are not small: a 3×3 conv
-/// over 480 channels has `9 × 480 = 4320` k values per position, so one round's
-/// im2col operand is ~9× the activation it produces.  At the whole-clip batch
-/// (177 chunks on a 180 s clip) the c1 activation alone would be 580 MB; tiling
-/// the chunk axis keeps the whole stem inside ~140 MB while leaving the GEMMs
-/// ~100-400 workgroups.  Mirrors the CPU reference's `CONV_TILE`.
+/// Chunks processed per conv-stem round.  The im2col operand is ~9× the
+/// activation it produces, so tiling the chunk axis bounds the stem's buffers.
 const CONV_TILE: usize = 8;
 /// `CONV_TILE`, published for the diagnostic's round bookkeeping.
 pub fn conv_tile() -> usize {
     CONV_TILE
 }
 
-/// Out-of-plane tap sentinel — **re-exported**, not redefined: the tap tables
-/// and the WGSL that reads them must agree or every out-of-bounds tap becomes a
-/// valid address (which is precisely what happened at `0xFFFF_FFFF` vs
-/// `0xFFFF`).
+/// Out-of-plane tap sentinel, re-exported: the tap tables and the WGSL that
+/// reads them must agree on it, or an out-of-bounds tap becomes a valid address.
 const TAP_OOB: u32 = shaders::TAP_OOB;
 
 // ─── Uniform layouts (byte-identical to the WGSL structs) ──────────
@@ -106,12 +70,9 @@ struct GDims {
     bsb: u32,
     bsc: u32,
     beta: u32,
-    /// Key-tile row offset in the B operand; 0 for every tower GEMM (the field
-    /// exists because the tower shares `shaders::prefill_gemm` with the decoder,
-    /// where the slabbed attention uses it).
+    /// Key-tile row offset in the B operand; 0 for every tower GEMM.
     row0: u32,
-    /// A row stride in elements; `k` for every tower GEMM (same reason as
-    /// `row0` — the decoder's slabbed AV gives its score slab a wider stride).
+    /// A row stride in elements; `k` for every tower GEMM.
     lda: u32,
 }
 
@@ -285,9 +246,8 @@ impl GpuLinear {
         Self::finish(up, label, w, bias, n, pad_k_tile(k))
     }
 
-    /// Conv weights arrive as `[c_out, c_in, 3, 3]` (or `[c_out, 1, 3, 3]`):
-    /// row-major flattening of the trailing axes is exactly the im2col k order,
-    /// so this is a plain 2-D view.
+    /// Conv weights `[c_out, c_in, 3, 3]`: row-major flattening of the trailing
+    /// axes is exactly the im2col k order.
     fn load_conv(
         up: &mut BulkUpload,
         weights: &HashMap<String, RawTensor>,
@@ -383,8 +343,7 @@ struct Pipes {
     /// `prefill_gemm(false, true)`: `C += A·Wᵀ`, for the two residual adds.
     gemm_beta: wgpu::ComputePipeline,
     /// `prefill_gemm(false, false, true)`: the per-column bias add (`qkv`,
-    /// `proj2`), and `prefill_gemm(false, true, true)` for the residual+biased
-    /// pair (`out_proj`, `fc2`).
+    /// `proj2`); `(false, true, true)` for residual+bias (`out_proj`, `fc2`).
     gemm_bias: wgpu::ComputePipeline,
     gemm_beta_bias: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
@@ -396,9 +355,8 @@ struct Pipes {
 
 // ─── Conv geometry: the single source of truth ────────────────────
 
-/// One conv round's tensors, in the buffers' own layouts — the comparator in
-/// `inference.rs` indexes them with the same `ConvLevel` fields the dispatches
-/// use, so a layout change cannot silently desynchronise the two.
+/// One conv round's tensors, in the buffers' own layouts (the same `ConvLevel`
+/// fields the dispatches use).
 pub struct ConvRound {
     pub chunk0: usize,
     pub n_chunks: usize,
@@ -417,8 +375,7 @@ pub struct AttnShot {
     pub q: Vec<f16>,
     pub k: Vec<f16>,
     pub v: Vec<f16>,
-    /// `[z][wpad][wpad]` raw scores and softmax probabilities, `[z][wpad][128]`
-    /// AV output.
+    /// `[z][wpad][wpad]` raw scores / softmax probs; `[z][wpad][128]` AV output.
     pub scores: Vec<f16>,
     pub probs: Vec<f16>,
     pub attn_out: Vec<f16>,
@@ -455,38 +412,24 @@ pub struct Capture {
     /// `[s_pad][conv_out.k]` before `conv_out`, and `[s_pad][d_model]` after.
     pub packed: Vec<f16>,
     pub h: Vec<f16>,
-    /// `[s_pad][d_model]` after each transformer layer (capture mode submits
-    /// once per layer, so this is what every layer actually produced).
+    /// `[s_pad][d_model]` after each transformer layer.
     pub layers: Vec<Vec<f16>>,
     /// Layer 0's attention internals, for a self-contained oracle.
     pub attn: Option<AttnShot>,
     pub embeds: Vec<f16>,
 }
 
-/// One conv level's geometry and weights.
+/// One conv level's geometry and weights (counts in f16 elements).
 ///
-/// Terms (all counts are in f16 *elements*, not bytes):
+/// A `position` is one `(h_out, w_out)` cell, row-major (`p = ho·w_out + wo`);
+/// `plane_pad = align(plane, 32)` is the per-chunk stride and
+/// `n_all = align(CONV_TILE·plane_pad, GEMM_BN)` the round's position count (the
+/// GEMM's `n` and the activation's channel stride, the same for every round).
 ///
-/// * `position` — one `(h_out, w_out)` cell of this level's output plane,
-///   flattened row-major (`p = ho·w_out + wo`).  A chunk produces `plane` of
-///   them; `plane_pad = align(plane, 32)` is the per-chunk stride every buffer
-///   and dispatch uses.
-/// * `n_all = align(CONV_TILE·plane_pad, GEMM_BN)` — the position count the
-///   whole round is laid out on: the GEMM's `n`, and the **channel stride** of
-///   this level's activation.  It is deliberately the same for every round
-///   (including the last, partial one) so the broadcast bias image has one
-///   shape; the positions a short round does not have are zero in the operand.
-/// * operand `[k_pad][n_all]` — the im2col output, i.e. the GEMM's `B` operand
-///   read with `transb = true` (row stride `n_all/2` words).
-/// * activation `[m_pad][n_all]` — the GEMM's `C`, channel-major with the
-///   channel stride `n_all` and `m_pad = align(c_out, GEMM_BM)` rows.  This is
-///   the layout `shaders::audio_permute_pe` and the next level's gather read,
-///   and it is the CPU reference's `[c_out][pos]` layout padded on both axes.
-///
-/// The input side is what the gather addresses: tap `t` of `(p, k)` reads
-/// `(chunk₀ + chunk)·in_chunk + ic·in_ic + tap`, `ic = k/9`, `tap` from the
-/// `[plane_in·9]` table.  `in_chunk` is one chunk's image, `in_ic` the channel
-/// stride (0 for the mel, where `c_in == 1` makes `ic` always 0).
+/// The operand is `[k_pad][n_all]` (the GEMM's `B`, `transb = true`); the
+/// activation is `[m_pad][n_all]` (the GEMM's `C`, channel-major).  The gather
+/// reads tap `t` of `(p, k)` at `(chunk₀ + chunk)·in_chunk + ic·in_ic + tap`,
+/// `ic = k/9`.
 struct ConvLevel {
     /// `align(CONV_TILE·plane_pad, GEMM_BN)`: the GEMM's `n` and the channel
     /// stride of the activation, constant for every round.
@@ -508,12 +451,10 @@ struct ConvLevel {
 }
 
 impl ConvLevel {
-    /// Build one level from the checkpoint weights and its **input** geometry.
-    ///
-    /// `h_in`/`w_in` are the true input plane the convolution runs over,
-    /// `w_stride` the input buffer's row stride (`w0` for the mel, else
-    /// `w_in`), `in_chunk`/`in_ic` what the gather strides read the input with
-    /// (see the struct docs) and `n_all` this level's position count.
+    /// Build one level from the checkpoint weights and its input geometry:
+    /// `h_in`/`w_in` is the input plane, `w_stride` the buffer row stride (`w0`
+    /// for the mel), `in_chunk`/`in_ic` the gather strides and `n_all` the
+    /// position count.
     #[allow(clippy::too_many_arguments)]
     fn build(
         up: &mut BulkUpload,
@@ -571,9 +512,8 @@ impl ConvLevel {
     }
 }
 
-/// A read-only view of one [`ConvLevel`], for the diagnostic comparator: it
-/// publishes exactly the numbers the dispatches are built from, so the two
-/// cannot drift.
+/// A read-only view of one [`ConvLevel`] for the diagnostic comparator, built
+/// from the same numbers the dispatches are.
 #[derive(Clone, Copy, Debug)]
 pub struct LevelView {
     /// Positions of the whole round per level (`align(CONV_TILE·plane_pad, BN)`).
@@ -617,8 +557,7 @@ pub struct GpuAudioEncoder {
     proj1: GpuLinear,
     proj2: GpuLinear,
     pe: wgpu::Buffer,
-    /// `proj1` bias broadcast to `[rows][proj1.n_pad]` — the final GELU runs on
-    /// a token-major activation, so its image is token-major too.
+    /// The final GELU runs on a token-major activation `[rows][proj1.n_pad]`.
     p: Pipes,
 
     /// Mel row stride (`cs` padded even), and the mel's per-chunk image size.
@@ -633,18 +572,15 @@ pub struct GpuAudioEncoder {
     col: [wgpu::Buffer; 3],
     raw: [wgpu::Buffer; 3],
     act: [wgpu::Buffer; 3],
-    /// Clip-sized tensors (`packed`, `mel_in`, the transformer's
-    /// activations) are allocated per `encode`: at `MAX_TOKENS` rows the big
-    /// ones are hundreds of MB each, and a clip rarely needs a third of that.
+    /// Clip-sized tensors (`packed`, `mel_in`, activations) per `encode`.
 
     // uniforms
     u_gd: wgpu::Buffer,
     u_im: [wgpu::Buffer; 3],
-    /// One `ScaleCfg` per *distinct* GELU shape — the three conv levels (whose
-    /// shapes are fixed), the FFN and `proj1` (sized per clip).  A single shared
-    /// uniform is wrong however many times it is written: `queue.write_buffer`
-    /// lands at the *next* submit, so every dispatch in one command buffer would
-    /// read the last value written, not its own.
+    /// One `ScaleCfg` per distinct GELU shape: the three conv levels, the FFN
+    /// and `proj1`.  A single shared uniform would be read by every dispatch as
+    /// the last value written, since `queue.write_buffer` lands at the next
+    /// submit.
     u_sc: [wgpu::Buffer; 5],
     u_ex: wgpu::Buffer,
     u_sm: wgpu::Buffer,
@@ -655,8 +591,7 @@ pub struct GpuAudioEncoder {
     u_cp: wgpu::Buffer,
 
     gd_slot: std::cell::Cell<usize>,
-    /// Diagnostic: snapshot `h` inside layer 0 (between the attention and the
-    /// FFN) so a layer-level mismatch can be split in two.
+    /// Diagnostic: snapshot `h` inside layer 0 (between attention and FFN).
     mid_capture: std::cell::Cell<bool>,
     mid_h: std::cell::RefCell<Option<Vec<f16>>>,
 }
@@ -670,8 +605,7 @@ struct Geom {
     s_win: usize,
 }
 
-/// Per-pass activation buffers, sized to this clip.  Grouped so the layer
-/// dispatches take one argument instead of fifteen.
+/// Per-pass activation buffers, sized to this clip.
 struct LayerCtx<'a> {
     geom: Geom,
     s_pad: usize,
@@ -751,12 +685,9 @@ impl GpuAudioEncoder {
 
         // ── conv geometry: one chain, stated once ──
         // Each level's *output* plane is the next level's *input* plane, so the
-        // tap tables are built from the input dims.  `conv_taps(h_out, w_out)` is
-        // a different (wrong) table: fed conv1's output dims it produced
-        // 32×25 = 800 positions, which is conv2's output, and 56 for conv3.
-        //
-        // `conv_out_len` is one `conv2d(3×3, s2, p1)` step; `feo` is three of
-        // them, i.e. the *token* count, not any single level's width.
+        // tap tables are built from the input dims.  `conv_out_len` is one
+        // `conv2d(3×3, s2, p1)` step; `feo` is three of them, i.e. the *token*
+        // count, not any single level's width.
         let w0 = pad_even(cs);
         let h1 = conv_out_len(n_mels);
         let t1 = conv_out_len(cs);
@@ -777,9 +708,8 @@ impl GpuAudioEncoder {
 
         // Per-level position counts.  `plane_pad` (32-position blocks — the
         // im2col's thread granularity) is the per-chunk stride; `n_all` is the
-        // whole round's position count and therefore the activation's channel
-        // stride.  Both are constant across rounds, so the broadcast bias image
-        // and the GEMM's `n` never move.
+        // round's position count and the activation's channel stride, constant
+        // across rounds.
         let planes = [h1 * t1, h2 * t2, h3 * t3];
         let plane_pads = planes.map(|p| align(p, 32));
         let n_alls = plane_pads.map(|p| align(CONV_TILE * p, GEMM_BN));
@@ -829,9 +759,7 @@ impl GpuAudioEncoder {
             anyhow::ensure!(l.fc1.k == dm && l.fc1.n == inter, "layer {i} fc1 {:?}", (l.fc1.n, l.fc1.k));
             anyhow::ensure!(l.fc2.k == inter && l.fc2.n == dm, "layer {i} fc2 {:?}", (l.fc2.n, l.fc2.k));
         }
-        // `proj1` maps `d_model` (896) → `output_dim` (1024) and `proj2` keeps
-        // that width; the shipped 0.6B checkpoint is `[896, 896]`/`[1024, 896]`
-        // because the audio tower's own `d_model` is the projection width.
+        // `proj1` maps `d_model` to `output_dim`; `proj2` keeps that width.
         anyhow::ensure!(
             proj1.k == dm && proj2.k == proj1.n && proj2.n == out_dim,
             "projector chain {:?}/{:?} (d_model {dm}, out {out_dim})",
@@ -891,9 +819,7 @@ impl GpuAudioEncoder {
         // ── conv buffers: one round's worth, allocated once ──
         // `col[i]` is the im2col operand `[k_pad][n_all]`, `raw[i]` the GEMM's
         // `C` (`[m_pad][n_all]`, pre-GELU) and `act[i]` the activation the next
-        // level gathers from.  Each gets its own buffer: the old code wrote the
-        // GELU result back over the operand the next gather still needed — in a
-        // third layout again.
+        // level gathers from.
         let f16s = |n: usize| (n * 2) as u64;
         let col = [
             up.storage("enc.c1_col", f16s(conv[0].k_pad * conv[0].n_all)),
@@ -1009,9 +935,8 @@ impl GpuAudioEncoder {
     }
 
     /// As [`Self::encode`], optionally snapshotting each conv round's tensors on
-    /// the host.  `cap` forces a submit+poll per readback, so it is a
-    /// diagnostic path only: the production call passes `None` and runs a whole
-    /// round — and then the transformer — without a host round trip.
+    /// the host.  `capture` forces a submit+poll per readback, so it is a
+    /// diagnostic path only.
     pub fn encode_capture(
         &mut self,
         gpu: &Gpu,
@@ -1114,10 +1039,8 @@ impl GpuAudioEncoder {
         let mut out = Capture::default();
 
         // ── conv stem: `CONV_TILE` chunks per round, one submit each ──
-        // The round is the unit that has to be submitted on its own: `u_im` /
-        // `u_pm` carry per-round values, and wgpu applies a `write_buffer` at
-        // the *next* submit, so two rounds in one submit would both read the
-        // second round's config.
+        // Each round must be its own submit: `u_im`/`u_pm` carry per-round
+        // values, and wgpu applies a `write_buffer` at the next submit.
         let mut ch0 = 0usize;
         while ch0 < n_chunks {
             let n = CONV_TILE.min(n_chunks - ch0);
@@ -1147,8 +1070,7 @@ impl GpuAudioEncoder {
 
         // ── conv_out + PE ──
         // Its own submit: the transformer's first `out_proj` GEMM writes into
-        // the residual buffer, so `h` has to be read back before it runs (and
-        // the debug capture needs the boundary anyway).
+        // the residual buffer, so `h` must be read back before it runs.
         self.gd_slot.set(0);
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         self.gemm(
@@ -1328,14 +1250,9 @@ impl GpuAudioEncoder {
             gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
             Some(&l.qkv.bias),
         );
-        // 3. split Q/K/V.  No PE here: the reference adds the positional
-        //    embedding to the *conv_out output*, which `add_pe` already did.
+        // 3. split Q/K/V (PE was already added to the conv_out output by
+        //    `add_pe`).
         {
-            // The uniform was created, bound and never written: every field read
-            // as 0, `n_tokens == 0` made the kernel return on its first guard, and
-            // Q/K/V stayed the allocator's zeros.  Scores, softmax and AV then
-            // compared equal to a host oracle that recomputed from those same
-            // zeros — a self-consistent block with no signal in it at all.
             gpu.queue.write_buffer(
                 &self.u_ex,
                 0,
@@ -1414,9 +1331,6 @@ impl GpuAudioEncoder {
             let bsa = wpad * hd / 2;
             let bsb = hd * wpad / 2;
             // `bsc` is in ELEMENTS: the epilogue divides the flat C index by 2.
-            // Passing words here (as this did) put every batch block but the
-            // first half a block early, so adjacent blocks overwrote each other
-            // in whatever order the workgroups happened to run.
             let bsc = wpad * wpad;
             self.gemm_batched(
                 gpu, enc, &self.p.gemm_t, ctx.qp, ctx.kt, ctx.scores,
@@ -1517,9 +1431,8 @@ impl GpuAudioEncoder {
 
     // ── dispatch helpers ──
 
-    /// `C += A·Wᵀ` — the residual form of [`Self::gemm`].  The transformer's
-    /// two residual adds must *accumulate* onto the residual buffer; running
-    /// them as plain GEMMs (as this did) silently dropped every residual.
+    /// `C += A·Wᵀ` — the residual form of [`Self::gemm`]; the transformer's two
+    /// residual adds accumulate onto the residual buffer.
     #[allow(clippy::too_many_arguments)]
     fn gemm_beta(
         &self,
@@ -1593,10 +1506,9 @@ impl GpuAudioEncoder {
         })
     }
 
-    /// Single-tile GEMM at `prefill_gemm`'s 64×64 tile edges: `a` is `[m, k]`,
-    /// `w` is `[n, k]` row-major, `c` is `[m, ldc]` — all packed f16, with `m`
-    /// rounded up to 64 (the A operand's allocation) and `n` a multiple of 64
-    /// (the padded weight row count).
+    /// Single-tile GEMM at `prefill_gemm`'s `GEMM_BM × GEMM_BN` tile edges: `a`
+    /// is `[m, k]`, `w` is `[n, k]` row-major, `c` is `[m, ldc]` — all packed
+    /// f16, with `m` rounded up to `GEMM_BM` and `n` a multiple of `GEMM_BN`.
     #[allow(clippy::too_many_arguments)]
     fn gemm(
         &self,
@@ -1618,17 +1530,10 @@ impl GpuAudioEncoder {
         );
     }
 
-    /// The conv GEMM for one level.
-    ///
-    /// `A` is the **weight** `[m_pad][k_pad]` and `B` the im2col operand, read
-    /// with `transb = 1` (i.e. as `[k_pad][n_all]`, row stride `n_all/2` words).
-    /// That orientation is what puts the *channel* on the GEMM's `m` and the
-    /// *position* on its `n`, so `C` comes out channel-major — the layout the
-    /// reference uses, the permute expects and the next level's gather reads.
-    ///
-    /// `A`'s row stride is `k/2` words, which is exactly the weight's own
-    /// layout, and `m_pad` is the weight's padded row count; `n_all` and `ldc`
-    /// are the same number, so a row of `C` is one channel's `n_all` positions.
+    /// The conv GEMM for one level: `A` is the weight `[m_pad][k_pad]`, `B` the
+    /// im2col operand read with `transb = 1` (`[k_pad][n_all]`, row stride
+    /// `n_all/2` words).  Channel lands on `m` and position on `n`, so `C` is
+    /// channel-major; `n_all == ldc`, one row per channel.
     fn gemm_conv(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, level: usize) {
         let l = &self.conv[level];
         self.dispatch_gemm(
@@ -1638,9 +1543,8 @@ impl GpuAudioEncoder {
         );
     }
 
-    /// The gather for one level: `input` is this level's input image and `cin0`
-    /// the **global** index of the round's first chunk in it (0 for the levels
-    /// that read the round-local activation, `chunk0` for the mel).
+    /// The gather for one level: `cin0` is the global index of the round's first
+    /// chunk in `input` (0 for round-local levels, `chunk0` for the mel).
     fn im2col(
         &self,
         gpu: &Gpu,
@@ -1784,11 +1688,8 @@ impl GpuAudioEncoder {
         cp.dispatch_workgroups(align(rows, GEMM_BM) as u32, (dm / 2).div_ceil(256) as u32, 1);
     }
 
-    /// One `prefill_gemm` dispatch per `(head, window)` block.
-    ///
-    /// `bsa`/`bsb` are in **words**, `bsc` in **elements** — see
-    /// [`crate::shaders::prefill_gemm`].  With `batch = 1` neither unit matters
-    /// (every base is 0), which is exactly how a wrong `bsc` survived here.
+    /// One `prefill_gemm` dispatch per `(head, window)` block; `bsa`/`bsb` are in
+    /// words, `bsc` in elements — see [`crate::shaders::prefill_gemm`].
     #[allow(clippy::too_many_arguments)]
     fn gemm_batched(
         &self,
@@ -1865,19 +1766,12 @@ impl GpuAudioEncoder {
         cp.dispatch_workgroups(gx, gy, batch.max(1) as u32);
     }
 
-    /// `dst[i] = gelu(src[i] + bias[c(i)])` over `n` f16 elements, two per
-    /// thread.
+    /// `dst[i] = gelu(src[i] + bias[c(i)])` over `n` f16 elements, two per thread.
     ///
-    /// `bias` is the *per-channel* vector (padded to the activation's channel
-    /// count with zeros), not a broadcast image: the old code materialised a
-    /// `[rows][n_pad]` image per layer, which at `MAX_TOKENS` rows was 117 MB
-    /// **per FFN layer**.  The channel index comes from the tensor's own layout:
-    /// `words` is the number of words per channel or per row, and `by_channel`
-    /// picks `i / words` (channel-major conv activation, channel stride
-    /// `n_all`) or `i % words` (token-major GEMM output, row stride `n_pad`).
-    ///
-    /// `n` is the *element* count; it must be even so a thread's two halves
-    /// never straddle the real/padding boundary of the channel vector.
+    /// `bias` is the per-channel vector, padded to the activation's channel
+    /// count with zeros.  `by_channel` picks `i / words` (channel-major conv
+    /// activation) or `i % words` (token-major GEMM output); `n` must be even so
+    /// a thread's two halves never straddle the channel vector's padding.
     fn bias_gelu_tensor(
         &self,
         gpu: &Gpu,
@@ -1918,8 +1812,7 @@ impl GpuAudioEncoder {
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.gelu);
         cp.set_bind_group(0, &bg, &[]);
-        // 256 threads × 2 halves = 512 elements per workgroup (the old divisor
-        // 600 covered only 85 % of the tensor and left the tail un-GELU'd).
+        // 256 threads × 2 halves = 512 elements per workgroup.
         cp.dispatch_workgroups(gx, gy, 1);
     }
 
@@ -1969,13 +1862,11 @@ pub fn last_pack_ms() -> f64 {
 // ─── helpers ───────────────────────────────────────────────────────
 
 /// Explicit layout for the GEMM family: storage buffers `0..n_storage` plus a
-/// uniform with a dynamic offset.  wgpu's implicit layouts are
-/// pipeline-exclusive and never enable dynamic offsets, and every GEMM dispatch
-/// here reads its own `GDims` slot out of one ring buffer.
+/// dynamic-offset uniform, since every GEMM dispatch reads its own `GDims` slot
+/// out of one ring buffer.
 ///
 /// `read_write` names the bindings the shader declares `read_write` (only the
-/// GEMM's `C`); a read-only buffer can bind where the shader is read-only, but
-/// not the other way round.
+/// GEMM's `C`).
 fn gemm_layout(gpu: &Gpu, label: &str, n_storage: u32, read_write: &[u32]) -> wgpu::PipelineLayout {
     let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..n_storage)
         .map(|binding| wgpu::BindGroupLayoutEntry {
@@ -2059,10 +1950,9 @@ fn read_f16_buf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize) -> Result<Vec<f16>> {
         .collect())
 }
 
-/// One `conv2d(3×3, stride 2, pad 1)` output length.  The reference's/// `feo`-style helper folds this three times — but note `feo` is *not* the same
-/// as three `conv_out_len` steps for every input (e.g. `feo(100) = 13` while
-/// `conv_out_len³(100) = 25`), so the tower uses the single-step form per layer
-/// and only ever calls `feo` where the reference does (the tail-token count).
+/// One `conv2d(3×3, stride 2, pad 1)` output length.  Three `conv_out_len` steps
+/// are not the same as `feo` (`feo(100) = 13`, `conv_out_len³(100) = 25`), so the
+/// single-step form is used per layer and `feo` only for the tail count.
 #[inline]
 /// Three `conv_out_len` steps: the *token* count a chunk produces, i.e. the
 /// height of conv3's output plane (`feo(n_mels)` at the mel's resolution).
@@ -2075,16 +1965,16 @@ pub(crate) fn conv_out_len(l: usize) -> usize {
     (l + 2 - 3) / 2 + 1
 }
 
-/// Elements of one mel "plane": all mel bins of one chunk, padded to `w0`.
-/// The staging buffer is sized the same way the encoder is: `cs`-frame chunks.
+/// Elements of one mel "plane": all mel bins of one `cs`-frame chunk, padded to
+/// `w0`.
 #[inline]
 fn mel_elems(n_mels: usize, w0: usize) -> usize {
     n_mels * w0
 }
 
-/// Zero-pad a `[rows, cols]` f16 matrix's columns to the next even count.  The
-/// GEMM reads packed f16 pairs along k, so an odd k shears every row by one
-/// half-word; the pad column is zero and the operand is zero there too.
+/// Zero-pad a `[rows, cols]` f16 matrix's columns to the next even count: the
+/// GEMM reads packed f16 pairs along k, so an odd k shears every row by half a
+/// word.
 fn pad_k(w: &PackedWeight) -> Result<PackedWeight> {
     let kw = pad_k_tile(w.cols);
     if kw == w.cols {
@@ -2106,9 +1996,8 @@ fn pad_k(w: &PackedWeight) -> Result<PackedWeight> {
     })
 }
 
-/// Zero-pad a `[rows, cols]` f16 matrix to `new_rows` — the n-tile width of
-/// `prefill_gemm`.  The GEMM only ever reads the rows it is told to, but a
-/// padded W keeps every dispatch on a whole tile and every stride exact.
+/// Zero-pad a `[rows, cols]` f16 matrix to `new_rows`, the n-tile width of
+/// `prefill_gemm`, keeping every dispatch on a whole tile and every stride exact.
 fn pad_rows(w: &PackedWeight, new_rows: usize) -> Result<PackedWeight> {
     anyhow::ensure!(new_rows >= w.rows, "pad_rows: shrink not supported");
     if new_rows == w.rows {
@@ -2129,16 +2018,10 @@ fn pad_rows(w: &PackedWeight, new_rows: usize) -> Result<PackedWeight> {
 
 /// Tap-offset table for a `3×3/s2/p1` conv over an `h × w_in` plane.
 ///
-/// `off[pos*9 + tap]` is the source offset of that tap *inside one input
-/// plane*, `TAP_OOB` outside it.  Positions are `(h_out, w_out)` row-major, the
-/// same order the GEMM's `n` axis uses, so `tap` doubles as a position index for
-/// the next level's gather.
-///
-/// `w_in` is the true width and `w_stride` the buffer's row stride (`w0` for the
-/// mel, else `= w_in`).  There is **one** sentinel: the old second one
-/// (`TAP_WRAP`, for the packed-pair read that no longer exists) was compared
-/// against a different constant in the shader than the table held, which made
-/// every out-of-bounds tap a valid address.
+/// `off[pos*9 + tap]` is that tap's source offset inside one input plane,
+/// `TAP_OOB` outside it; positions are `(h_out, w_out)` row-major, the order the
+/// GEMM's `n` axis uses.  `w_in` is the true width, `w_stride` the buffer's row
+/// stride (`w0` for the mel, else `= w_in`).
 fn conv_taps(h: usize, w_in: usize, w_stride: usize) -> (Vec<u32>, usize, usize, usize) {
     let h_out = (h + 2 - 3) / 2 + 1;
     let w_out = (w_in + 2 - 3) / 2 + 1;
@@ -2162,10 +2045,8 @@ fn conv_taps(h: usize, w_in: usize, w_stride: usize) -> (Vec<u32>, usize, usize,
     (off, h_out * w_out, h_out, w_out)
 }
 
-/// A linear's bias as a standalone vector padded to `n_pad` with zeros, so
-/// both the GEMM's `bias = 1` epilogue and `bias_gelu` can index it without a
-/// bound check (an activation's padding channels/columns are zero and must stay
-/// zero).
+/// A linear's bias padded to `n_pad` with zeros, so the GEMM's `bias = 1`
+/// epilogue and `bias_gelu` can index it without a bound check.
 fn upload_bias(up: &mut BulkUpload, label: &str, n: usize, n_pad: usize, host: &[f16]) -> Result<wgpu::Buffer> {
     let mut v = vec![f16::ZERO; n_pad.max(n)];
     v[..n].copy_from_slice(host);
@@ -2197,18 +2078,10 @@ fn pad_even(v: usize) -> usize {
     }
 }
 
-/// Round `k` up to a multiple of the GEMM's k-tile (`PREFILL_GEMM_BK`).
-///
-/// Two constraints, and the second is the one that bites:
-///
-/// * the A operand is indexed as `array<u32>` with a word row stride of `k/2`,
-///   so `k` must be even (a multiple of 4 keeps every pair word-aligned);
-/// * the k loop runs **whole 16-wide tiles** (`k0 += BK` while `k0 < gd.k`),
-///   so the last tile covers `align(k, 16)` values.  With `k` merely padded to
-///   4, those extra reads walk past the operand's row into the next one and
-///   their products are **added** to every output.  The padding is zero on both
-///   sides only when the operand row really is that wide, i.e. when `k` is a
-///   multiple of `BK`.
+/// Round `k` up to a multiple of the GEMM's k-tile (`PREFILL_GEMM_BK`): `k` must
+/// be even (the A operand is `array<u32>` with a `k/2` word row stride) and the
+/// k loop's last whole 16-wide tile reads `align(k, 16)` values, so the padding
+/// is zero on both sides only when `k` is a multiple of `BK`.
 #[inline]
 fn pad_k_tile(k: usize) -> usize {
     align(k, GEMM_BK)
