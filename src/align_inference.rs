@@ -42,6 +42,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use crate::align_input::AlignerInput;
+use crate::postprocess::AlignItem;
 use crate::audio_encoder_gpu::GpuAudioEncoder;
 use crate::config::AsrConfig;
 use crate::cpu_tensor::{CpuTensor, CpuWeight};
@@ -59,6 +60,8 @@ pub struct AlignerConfig {
     pub num_labels: usize,
     pub audio_token_id: u32,
     pub max_seq: usize,
+    /// The checkpoint's declared language list.
+    pub support_languages: Vec<String>,
 }
 
 impl AlignerConfig {
@@ -76,6 +79,7 @@ impl AlignerConfig {
             num_labels: head.num_labels,
             audio_token_id: cfg.thinker_config.audio_token_id as u32,
             max_seq: 8192,
+            support_languages: cfg.support_languages.clone(),
         })
     }
 }
@@ -145,6 +149,9 @@ impl Backend {
 
 pub struct Aligner {
     backend: Backend,
+    /// Built once: the BPE tokenizer is a 300 MB vocabulary and re-reading it per
+    /// clip was the CLI's job only because this used to live there.
+    input_builder: crate::align_input::InputBuilder,
     /// `[vocab, hidden]`, kept on the host: the gather is `n_text_tokens` rows out
     /// of 152 064, so uploading the table to do it would move 300 MB to read back 1.
     embed_tokens: RawTensor,
@@ -247,8 +254,12 @@ impl Aligner {
             .context("final norm weight missing")?
             .to_f32_vec()?;
 
+        let input_builder =
+            crate::align_input::InputBuilder::load(model_dir, cfg.timestamp_token_id)?;
+
         Ok(Self {
             backend,
+            input_builder,
             embed_tokens,
             score,
             final_norm,
@@ -271,6 +282,94 @@ impl Aligner {
 
     pub fn config(&self) -> &AlignerConfig {
         &self.cfg
+    }
+
+    /// The reference's entry point: an audio file, its transcript, a language —
+    /// back come the aligned words with times in seconds.
+    ///
+    /// This is `Qwen3ForcedAligner.align(audio, text, language)`.  Everything the
+    /// caller used to have to do by hand — decode and resample the wav, run the
+    /// log-mel, split the transcript into words, assemble and tokenise
+    /// `[151669] + [151676]xN + [151670] + words`, repair the timestamps, pair
+    /// them with the words — happens in here, in the reference's order.
+    pub fn align(
+        &mut self,
+        audio: &Path,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<AlignItem>> {
+        self.check_language(language)?;
+        let samples = crate::mel::load_audio_wav(audio, 16000)?;
+        let (mel, _bins, _frames) = crate::mel::mel_features(&samples)?;
+        let valid = crate::align_input::valid_mel_frames(samples.len());
+
+        // The processor right-pads the mel axis to a multiple of `n_window * 2`
+        // with 0.0 before the encoder ever sees it.
+        let padded = crate::align_input::padded_mel_frames(valid, self.input_builder.n_window());
+        let mut mel = mel;
+        mel.resize(self.cfg.audio_cfg.num_mel_bins * padded, 0.0);
+
+        let words = crate::words::split_words(text, language)?;
+        let input = self.input_builder.build(&words, valid)?;
+        let raw_ms = self.align_raw_ms(&mel, valid, &input)?;
+        crate::postprocess::decode_timestamps(&words, &raw_ms)
+    }
+
+    /// The reference's list form: one `(audio, text, language)` triple per
+    /// sample, one result list each.
+    pub fn align_many(
+        &mut self,
+        requests: &[(std::path::PathBuf, String, Option<String>)],
+    ) -> Result<Vec<Vec<AlignItem>>> {
+        let mut out = Vec::with_capacity(requests.len());
+        for (audio, text, language) in requests {
+            out.push(self.align(audio, text, language.as_deref())?);
+        }
+        Ok(out)
+    }
+
+    /// The languages the forced aligner supports — the same set as
+    /// `FORCED_ALIGNER_LANGUAGES` in `processing_qwen3_asr.py`, which is where the
+    /// reference actually enforces it (`prepare_forced_aligner_inputs` raises on
+    /// anything else).
+    ///
+    /// Read from the checkpoint when its config declares `support_languages`, as
+    /// the original-layout checkpoint does.  The **`-hf` repackaging dropped that
+    /// field**, so for the checkpoint this port is gated against the list has to
+    /// come from here; returning an empty list would silently accept every
+    /// language and defer the failure to a wrong alignment.
+    pub const FORCED_ALIGNER_LANGUAGES: [&'static str; 11] = [
+        "Chinese", "Cantonese", "English", "French", "German", "Italian",
+        "Japanese", "Korean", "Portuguese", "Russian", "Spanish",
+    ];
+
+    /// The reference's `get_supported_languages()`: lowercased and sorted.
+    pub fn supported_languages(&self) -> Vec<String> {
+        let declared = if self.cfg.support_languages.is_empty() {
+            Self::FORCED_ALIGNER_LANGUAGES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            self.cfg.support_languages.clone()
+        };
+        let mut v: Vec<String> = declared.iter().map(|s| s.to_lowercase()).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The reference rejects a language outside the set rather than aligning
+    /// against the wrong tokeniser.
+    fn check_language(&self, language: Option<&str>) -> Result<()> {
+        let Some(l) = language else { return Ok(()) };
+        let l = l.to_lowercase();
+        let supported = self.supported_languages();
+        anyhow::ensure!(
+            supported.contains(&l),
+            "language {l:?} is not supported by the forced aligner; supported: {supported:?}"
+        );
+        Ok(())
     }
 
     /// One sample: mel + a built input sequence in, one raw millisecond value per
@@ -436,3 +535,46 @@ impl BatchSample {
         crate::align_input::padded_mel_frames(self.valid_frames, 50)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gold::{Dtype, GoldJson};
+
+    /// The reference-shaped entry point has to give exactly what the gate gives.
+    ///
+    /// The gate drives the pipeline stage by stage (wav, mel, words, input,
+    /// forward, decode) and the public `align()` drives it in one call; if those
+    /// two ever disagree, one of them is lying about what the library does.
+    #[test]
+    fn align_matches_the_staged_gate_path() {
+        let dir = crate::gold::model_dir();
+        let fixtures = crate::gold::fixtures_dir();
+        if !dir.join("config.json").is_file() || !fixtures.is_dir() {
+            return;
+        }
+        let mut aligner =
+            Aligner::load(crate::gpu::DeviceSelector::Cpu, &dir).expect("load (cpu)");
+        assert_eq!(aligner.backend_name(), "cpu");
+
+        // The checkpoint declares its languages; the API must report them.
+        let langs = aligner.supported_languages();
+        assert!(langs.contains(&"english".to_string()), "{langs:?}");
+        assert!(langs.contains(&"japanese".to_string()), "{langs:?}");
+        assert!(langs.iter().all(|l| l == &l.to_lowercase()), "not lowercased");
+
+        let gold = GoldJson::load(Dtype::Fp32, "15s_en").unwrap();
+        let audio = fixtures.join("15s_en.wav");
+        let items = aligner
+            .align(&audio, &gold.transcript, Some(&gold.language))
+            .expect("align");
+
+        assert_eq!(items.len(), gold.words.len(), "word count");
+        for (i, (got, want)) in items.iter().zip(&gold.items).enumerate() {
+            assert_eq!(got.text, want.text, "word {i}");
+            assert_eq!(got.start_time, want.start_time, "word {i} start");
+            assert_eq!(got.end_time, want.end_time, "word {i} end");
+        }
+    }
+}
+

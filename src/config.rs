@@ -9,6 +9,10 @@ pub struct AsrConfig {
     /// `Qwen3ASRForTokenClassification`; this is the timestamp head's geometry.
     #[serde(skip)]
     pub align: Option<AlignHeadConfig>,
+    /// The languages this checkpoint declares, as written in `config.json`.
+    /// Empty for checkpoints that do not list any.
+    #[serde(skip)]
+    pub support_languages: Vec<String>,
 }
 
 /// The forced-aligner head: a `Linear(hidden -> num_labels)` scored per
@@ -168,6 +172,10 @@ struct AsrConfigFile {
     /// is the only place `num_labels` is recorded.
     #[serde(default)]
     id2label: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The aligner's declared language list, e.g.
+    /// `["Chinese", "Cantonese", "English", ...]`.
+    #[serde(default)]
+    support_languages: Vec<String>,
 }
 
 impl AsrConfig {
@@ -206,7 +214,11 @@ impl AsrConfig {
                 thinker.text_config.rope_theta = theta;
             }
         }
-        Ok(AsrConfig { thinker_config: thinker, align })
+        Ok(AsrConfig {
+            thinker_config: thinker,
+            align,
+            support_languages: raw.support_languages,
+        })
     }
 }
 
