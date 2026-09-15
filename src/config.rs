@@ -347,28 +347,18 @@ mod tests {
 
     #[test]
     fn test_load_shipped_legacy_and_hf_configs() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let legacy = root.join("models/Qwen3-ASR-0.6B/config.json");
-        if legacy.is_file() {
-            let cfg = AsrConfig::from_file(&legacy).unwrap();
-            assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 18);
-            assert_eq!(cfg.thinker_config.text_config.num_hidden_layers, 28);
+        // Both layouts, parsed from the checkpoint this crate actually ships
+        // against.  The original-layout branch is exercised by the inline JSON
+        // in `test_parse_hf_native_config_layout`, which needs no checkpoint on
+        // disk.
+        let path = crate::gold::model_dir().join("config.json");
+        if !path.is_file() {
+            return;
         }
-        let hf = std::path::Path::new(r"D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf\config.json");
-        if hf.is_file() {
-            let cfg = AsrConfig::from_file(hf).unwrap();
-            assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 18);
-            assert_eq!(cfg.thinker_config.text_config.hidden_size, 1024);
-            assert_eq!(cfg.thinker_config.text_config.rope_theta, 1_000_000.0);
-            assert_eq!(cfg.thinker_config.audio_token_id, 151676);
-        }
-        let hf17 = std::path::Path::new(r"D:\Qwen3-ASR\models\Qwen3-ASR-1.7B-hf\config.json");
-        if hf17.is_file() {
-            let cfg = AsrConfig::from_file(hf17).unwrap();
-            assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 24);
-            assert_eq!(cfg.thinker_config.text_config.hidden_size, 2048);
-            assert_eq!(cfg.thinker_config.audio_config.output_dim, 2048);
-        }
+        let cfg = AsrConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 24);
+        assert_eq!(cfg.thinker_config.text_config.hidden_size, 1024);
+        assert_eq!(cfg.thinker_config.audio_config.output_dim, 1024);
     }
 
     #[test]
