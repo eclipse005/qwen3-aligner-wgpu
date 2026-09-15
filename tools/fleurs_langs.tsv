@@ -1,0 +1,40 @@
+# Qwen3-ASR's 30 supported languages -> FLEURS config, the primary metric for
+# that language (cer for the scripts without word boundaries, wer for the rest;
+# `tools/score_asr.py` prints both for every language anyway), and the code that
+# picks the text normalizer inside the scorer.
+#
+# `--` = no FLEURS config in the reachable mirror (modelscope.cn/pengzhendong/fleurs
+# has 98 of the 102 configs; Cantonese `yue_hant_hk` is one of the missing ones).
+# Keep the table complete so the gap stays visible.
+#
+# language	config	metric	code
+Chinese	cmn_hans_cn	cer	zh
+English	en_us	wer	en
+Cantonese	--	cer	zh
+Arabic	ar_eg	wer	ar
+German	de_de	wer	de
+French	fr_fr	wer	fr
+Spanish	es_419	wer	es
+Portuguese	pt_br	wer	pt
+Indonesian	id_id	wer	id
+Italian	it_it	wer	it
+Korean	ko_kr	cer	ko
+Russian	ru_ru	wer	ru
+Thai	th_th	cer	th
+Vietnamese	vi_vn	wer	vi
+Japanese	ja_jp	cer	ja
+Turkish	tr_tr	wer	tr
+Hindi	hi_in	wer	hi
+Malay	ms_my	wer	ms
+Dutch	nl_nl	wer	nl
+Swedish	sv_se	wer	sv
+Danish	da_dk	wer	da
+Finnish	fi_fi	wer	fi
+Polish	pl_pl	wer	pl
+Czech	cs_cz	wer	cs
+Filipino	fil_ph	wer	fil
+Persian	fa_ir	wer	fa
+Greek	el_gr	wer	el
+Romanian	ro_ro	wer	ro
+Hungarian	hu_hu	wer	hu
+Macedonian	mk_mk	wer	mk
