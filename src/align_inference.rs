@@ -109,8 +109,18 @@ impl Backend {
         }
     }
 
+    /// Make sure the KV cache holds `need` positions — a no-op when it already
+    /// does, which is the common case (the capacity is grow-only).
+    fn ensure_capacity(&mut self, need: usize) -> usize {
+        match self {
+            Backend::Gpu { decoder, .. } => decoder.ensure_capacity(need),
+            Backend::Cpu { decoder, .. } => decoder.ensure_capacity(need),
+        }
+    }
+
     /// `[seq, hidden]` f16 hidden states after the last text layer.
     fn text_hidden(&mut self, bytes: &[u8], seq: usize) -> Result<Vec<f16>> {
+        self.ensure_capacity(seq);
         match self {
             Backend::Gpu { decoder, .. } => {
                 // The ASR path's first decode token is meaningless here; the

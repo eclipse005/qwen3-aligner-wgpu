@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use half::f16;
 use rayon::prelude::*;
 
-use crate::decoder::TextConfig;
+use crate::decoder::{TextConfig, KV_INITIAL_CAP, KV_STEP};
 use crate::weights::{self, RawTensor};
 
 /// A `[rows, cols]` weight matrix, row-major `[out_features, in_features]` —
@@ -186,21 +186,19 @@ impl Layer {
 /// so the caller can switch between them with one enum.
 pub struct CpuTextDecoder {
     cfg: TextConfig,
-    embed: Vec<f16>,
-    vocab: usize,
     hs: usize,
     layers: Vec<Layer>,
-    norm_w: Vec<f32>,
+    /// The ceiling on the sequence length — fixed at load.
     pub max_seq: usize,
-    /// Positions already in the KV cache (the GPU decoder's `pos`).
-    pub pos: usize,
-    /// The token whose embedding the next [`Self::step`] consumes.
-    last_token: u32,
+    /// KV slots actually allocated: [`KV_INITIAL_CAP`] after load, grown on
+    /// demand up to `max_seq`.  Both caches are strided by this, not by the
+    /// ceiling.
+    pub cap: usize,
     /// f16-rounded RoPE tables, `[position][head_dim]` — the same values the GPU
     /// uploads, so the rounding matches.
     cos: Vec<f32>,
     sin: Vec<f32>,
-    /// `[layer][nkvh][max_seq][hd]` — the GPU caches hold f16; these hold the
+    /// `[layer][nkvh][cap][hd]` — the GPU caches hold f16; these hold the
     /// **same** values already widened to f32, so the attention loops do not pay
     /// a per-element `f16 → f32` once per query row.  Every store goes through
     /// `f16::from_f32` first, so the numbers are bit-identical to the GPU's
@@ -222,28 +220,17 @@ impl CpuTextDecoder {
     ) -> Result<Self> {
         let w = weights::load_tensors(model_dir)?;
         let hs = cfg.hidden_size;
-        let (embed, shape) = weights::get_f16(&w, &format!("{prefix}.embed_tokens.weight"))?;
-        if shape.len() != 2 || shape[0] != cfg.vocab_size || shape[1] != hs {
-            bail!("embed_tokens is {shape:?}, expected [{}, {}]", cfg.vocab_size, hs);
-        }
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| Layer::load(&w, &format!("{prefix}.layers.{i}")))
             .collect::<Result<Vec<_>>>()?;
-        let norm_w: Vec<f32> = weights::get_vector(&w, &format!("{prefix}.norm.weight"))?
-            .into_iter()
-            .map(|v| v.to_f32())
-            .collect();
         let zeros = vec![0.0f32; rope_positions * cfg.head_dim];
-        let kv = cfg.num_key_value_heads * max_seq * cfg.head_dim;
+        let cap = KV_INITIAL_CAP.min(max_seq);
+        let kv = cfg.num_key_value_heads * cap * cfg.head_dim;
         Ok(Self {
-            vocab: cfg.vocab_size,
             hs,
-            embed,
             layers,
-            norm_w,
             max_seq,
-            pos: 0,
-            last_token: 0,
+            cap,
             cos: zeros.clone(),
             sin: zeros,
             k_cache: vec![0.0; cfg.num_hidden_layers * kv],
@@ -261,14 +248,37 @@ impl CpuTextDecoder {
         debug_assert_eq!(self.cos.len() % hd, 0);
     }
 
+    /// Grow both KV caches so that they hold `need` positions.
+    ///
+    /// Same contract as the GPU decoder's: grow-only, stepped ([`KV_STEP`]), and
+    /// a request that already fits costs one comparison.
+    pub fn ensure_capacity(&mut self, need: usize) -> usize {
+        let target = (need.div_ceil(KV_STEP) * KV_STEP).min(self.max_seq).max(self.cap);
+        if target == self.cap {
+            return self.cap;
+        }
+        let t0 = std::time::Instant::now();
+        let prev = self.cap;
+        let n = self.cfg.num_hidden_layers * self.cfg.num_key_value_heads * target * self.cfg.head_dim;
+        // Release before reallocating: the old contents are dead (every clip
+        // writes its KV from position zero), and holding both would double the
+        // transient peak of an already large allocation.
+        self.k_cache = Vec::new();
+        self.v_cache = Vec::new();
+        self.k_cache = vec![0.0f32; n];
+        self.v_cache = vec![0.0f32; n];
+        self.cap = target;
+        eprintln!(
+            "[kv] cpu capacity {prev} -> {target} slots ({:.0} MiB host) in {:.1} ms",
+            (2 * n * 4) as f64 / (1024.0 * 1024.0),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        self.cap
+    }
+
     fn rope_at(&self, pos: usize, j: usize) -> (f32, f32) {
         let hd = self.cfg.head_dim;
         (self.cos[pos * hd + j], self.sin[pos * hd + j])
-    }
-
-    fn embed_row(&self, token: u32, out: &mut [f16]) {
-        let row = &self.embed[token as usize * self.hs..(token as usize + 1) * self.hs];
-        out.copy_from_slice(row);
     }
 
     /// rms_norm over one row: f32 reduction, f16 output (the GPU writes f16).
@@ -314,7 +324,7 @@ impl CpuTextDecoder {
         let (nqh, nkvh, hd) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
         let rep = nqh / nkvh;
-        let kv_stride = self.max_seq * hd;
+        let kv_stride = self.cap * hd;
         let base = layer * nkvh * kv_stride;
         let _cur = (q0 + attn.len() / (nqh * hd)).min(self.max_seq);
 
@@ -331,7 +341,7 @@ impl CpuTextDecoder {
             .map_init(
                 || {
                     (
-                        vec![0.0f32; self.max_seq],
+                        vec![0.0f32; self.cap],
                         vec![0.0f32; hd],
                         vec![0.0f32; hd],
                     )
@@ -339,7 +349,7 @@ impl CpuTextDecoder {
                 |(scores, acc, qrow), (hi, out)| {
             let (r, h) = (hi / nqh, hi % nqh);
             let pos = q0 + r;
-            let valid = (pos + 1).min(self.max_seq);
+            let valid = (pos + 1).min(self.cap);
             {
                 let qh = &q[r * row_elems + h * hd..r * row_elems + (h + 1) * hd];
                 // The query head is f16 (it comes out of the rope epilogue), so
@@ -404,7 +414,7 @@ impl CpuTextDecoder {
         let (nqh, nkvh, hd) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
         let (q_dim, kv_dim) = (nqh * hd, nkvh * hd);
         let inter = self.cfg.intermediate_size;
-        let kv_stride = self.max_seq * hd;
+        let kv_stride = self.cap * hd;
 
         let mut normed = vec![f16::from_f32(0.0); rows * hs];
         let mut q = vec![f16::from_f32(0.0); rows * q_dim];
@@ -497,71 +507,11 @@ impl CpuTextDecoder {
         }
     }
 
-    fn final_norm_logits(&self, x: &[f16]) -> Vec<f32> {
-        let hs = self.hs;
-        let mut normed = vec![f16::from_f32(0.0); hs];
-        self.rms_norm_row(&x[x.len() - hs..], &self.norm_w, &mut normed);
-        let mut logits = vec![0.0f32; self.vocab];
-        logits.par_iter_mut().enumerate().for_each(|(t, out)| {
-            let row = &self.embed[t * hs..(t + 1) * hs];
-            let mut acc = 0.0f32;
-            for (wv, xv) in row.iter().zip(&normed) {
-                acc += wv.to_f32() * xv.to_f32();
-            }
-            *out = acc;
-        });
-        logits
-    }
-
-    fn argmax(&self, logits: &[f32]) -> i32 {
-        let mut best = 0usize;
-        for (i, v) in logits.iter().enumerate() {
-            if *v > logits[best] {
-                best = i;
-            }
-        }
-        best as i32
-    }
-
-    /// The GPU decoder's `prefill`: run `s` positions of f16 hidden states
-    /// (little-endian words, `[s][hs]`) through every layer, then return the
-    /// argmax of the last position.
-    pub fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
-        let hs = self.hs;
-        anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
-        anyhow::ensure!(
-            kv_start + s <= self.max_seq,
-            "prefill needs {} positions, max_seq is {}",
-            kv_start + s,
-            self.max_seq
-        );
-        let mut x: Vec<f16> = hidden_words[..s * hs * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let t0 = std::time::Instant::now();
-        self.forward(&mut x, kv_start, s);
-        self.pos = kv_start + s;
-        if std::env::var("QASR_CPU_PROFILE").is_ok() {
-            let [norm, proj, rope, attn, mlp] = self.profile;
-            eprintln!(
-                "[cpu] prefill {} rows: norm {norm:.0} / proj {proj:.0} / rope {rope:.0} / attn {attn:.0} / mlp {mlp:.0} ms (forward {:.0} ms)",
-                s,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        let logits = self.final_norm_logits(&x);
-        let tok = self.argmax(&logits);
-        self.last_token = tok as u32;
-        Ok(tok)
-    }
-
-    /// As [`Self::prefill`], but hands back the post-layer hidden states instead
-    /// of running the head.
+    /// Run `s` positions of f16 hidden states (little-endian words, `[s][hs]`)
+    /// through every layer and hand back all `s` rows of `[s, hidden]` f16.
     ///
     /// The aligner reads its timestamps off *every* `<timestamp>` row, not just
-    /// the last one, so it needs all `s` rows of `[s, hidden]` f16 — the same
-    /// data the GPU decoder exposes as `debug_prefill_h`.
+    /// the last one — the same data the GPU decoder leaves in `debug_prefill_h`.
     pub fn prefill_hidden(
         &mut self,
         hidden_words: &[u8],
@@ -582,7 +532,6 @@ impl CpuTextDecoder {
             .collect();
         let t0 = std::time::Instant::now();
         self.forward(&mut x, kv_start, s);
-        self.pos = kv_start + s;
         if std::env::var("QASR_CPU_PROFILE").is_ok() {
             let [norm, proj, rope, attn, mlp] = self.profile;
             eprintln!(
@@ -591,21 +540,6 @@ impl CpuTextDecoder {
             );
         }
         Ok(x)
-    }
-
-    /// The GPU decoder's `step`: embed the previous token, run one position.
-    pub fn step(&mut self) -> Result<i32> {
-        let hs = self.hs;
-        anyhow::ensure!(self.pos < self.max_seq, "decode past max_seq {}", self.max_seq);
-        let mut x = vec![f16::from_f32(0.0); hs];
-        self.embed_row(self.last_token, &mut x);
-        let q0 = self.pos;
-        self.forward(&mut x, q0, 1);
-        self.pos += 1;
-        let logits = self.final_norm_logits(&x);
-        let tok = self.argmax(&logits);
-        self.last_token = tok as u32;
-        Ok(tok)
     }
 
     /// Decoder shape summary, used by the CLI.
