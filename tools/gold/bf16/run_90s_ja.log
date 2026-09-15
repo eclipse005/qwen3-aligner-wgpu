@@ -1,16 +1,0 @@
-model sha256 : 00568245ceca5af1991d28562a75fe1ddc9bfeb041c27fda66947ea05c47fb86
-versions     : {'python': '3.10.0', 'torch': '2.8.0+cu128', 'transformers': '5.17.0', 'cuda': '12.8', 'device': 'NVIDIA P104-100', 'capability': [6, 1]}
-sm clock     : NVIDIA P104-100, 1885 MHz, 1911 MHz, 47
-=== 90s_ja[bfloat16] (Japanese) ===
-wav        : D:\qwen3-asr-rs\tests\fixtures\90s_ja.wav
-transcript : python-hf_0.6B_90s_ja.txt
-model      : D:\Qwen3-ASR\models\Qwen3-ForcedAligner-0.6B-tf
-Loading weights:   0%|          | 0/708 [00:00<?, ?it/s]Loading weights:   6%|▌         | 41/708 [00:00<00:01, 394.85it/s]Loading weights:  11%|█▏        | 81/708 [00:00<00:01, 396.67it/s]Loading weights:  17%|█▋        | 123/708 [00:00<00:01, 400.74it/s]Loading weights:  24%|██▍       | 171/708 [00:00<00:01, 420.67it/s]Loading weights:  31%|███       | 217/708 [00:00<00:01, 429.45it/s]Loading weights:  37%|███▋      | 261/708 [00:00<00:01, 429.19it/s]Loading weights:  43%|████▎     | 305/708 [00:00<00:00, 428.85it/s]Loading weights:  49%|████▉     | 348/708 [00:00<00:00, 416.25it/s]Loading weights:  55%|█████▌    | 390/708 [00:01<00:01, 274.36it/s]Loading weights:  60%|█████▉    | 424/708 [00:01<00:01, 155.41it/s]Loading weights:  64%|██████▍   | 454/708 [00:01<00:01, 175.84it/s]Loading weights:  69%|██████▊   | 485/708 [00:01<00:01, 196.45it/s]Loading weights:  73%|███████▎  | 514/708 [00:01<00:00, 212.32it/s]Loading weights:  77%|███████▋  | 543/708 [00:02<00:00, 227.37it/s]Loading weights:  81%|████████  | 573/708 [00:02<00:00, 240.33it/s]Loading weights:  85%|████████▌ | 602/708 [00:02<00:00, 248.17it/s]Loading weights:  89%|████████▉ | 630/708 [00:02<00:00, 253.74it/s]Loading weights:  93%|█████████▎| 661/708 [00:02<00:00, 265.80it/s]Loading weights:  97%|█████████▋| 690/708 [00:02<00:00, 265.35it/s]Loading weights: 100%|██████████| 708/708 [00:02<00:00, 272.28it/s]
-timestamp_token_id=151705  timestamp_segment_time=80.0  num_labels=5000
-words      : 210  first=['おお', '女子', 'アナ', 'の', '仕事', 'に']  last=['たたたたたたたたたたえ', 'この', '日常']
-wav        : 1429235 samples @16k (source 16000 Hz, 89.327 s), peak=0.4324
-seq_len    : 1887  audio_tokens=1161  timestamp_tokens=420 (expect 420)
-forward    : 1.696 s   logits (1, 1887, 5000)   NVIDIA P104-100, 1885 MHz, 1911 MHz, 50
-timestamps : 210 words  span 0.000..86.880 s  audio 89.327 s  out-of-range=0
-wrote      : D:\qwen-aligner-wgpu\tools\gold\bf16\90s_ja.tsv
-ONE CLIP DONE

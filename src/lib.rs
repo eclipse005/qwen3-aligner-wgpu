@@ -37,16 +37,15 @@ pub mod config;
 pub mod cpu_decoder;
 pub mod cpu_tensor;
 pub mod decoder;
-pub mod gold;
 pub mod gpu;
 pub mod mel;
 pub mod mrope;
+pub mod paths;
 pub mod postprocess;
 pub mod shaders;
 pub mod weights;
 pub mod words;
 
-pub use gold::{Dtype, GoldJson, Verdict};
 pub use gpu::{list_devices, DeviceInfo, DeviceSelector, Gpu};
 pub use mel::load_audio_wav;
 pub use postprocess::{decode_timestamps, fix_timestamps, AlignItem};

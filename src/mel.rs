@@ -439,12 +439,12 @@ mod fast_reader_tests {
     /// timestamp.
     #[test]
     fn fast_pcm16_equals_hound_for_every_fixture() {
-        let dir = crate::gold::fixtures_dir();
+        let dir = crate::paths::fixtures_dir();
         if !dir.is_dir() {
             return;
         }
         let mut checked = 0usize;
-        for clip in crate::gold::CLIPS {
+        for clip in crate::paths::CLIPS {
             let path = dir.join(format!("{clip}.wav"));
             if !path.is_file() {
                 continue;

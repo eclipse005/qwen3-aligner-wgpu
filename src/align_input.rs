@@ -277,32 +277,40 @@ mod tests {
         assert_eq!(conv3_length(100), 13);
     }
 
-    /// Every fixture's `n_audio_tokens`, recomputed from its sample count, which
-    /// is itself recovered from the source wav so nothing is taken on trust.
+    /// Sample counts either side of a chunk boundary, including the two shapes
+    /// that are easy to get wrong: an exact multiple of the chunk length (no
+    /// remainder at all) and a remainder of one.
     #[test]
-    fn audio_token_count_matches_every_gold() {
-        let fixtures = crate::gold::fixtures_dir();
-        if !fixtures.is_dir() {
-            return;
-        }
-        for (clip, want) in [
-            ("15s_en", 195usize),
-            ("30s_zh", 392),
-            ("90s_ja", 1161),
-            ("90s_en", 1170),
-            ("180s_en", 2292),
-            ("180s_zh", 2340),
-        ] {
-            let samples = crate::mel::load_audio_wav(fixtures.join(format!("{clip}.wav")), 16000)
-                .unwrap()
-                .len();
+    fn audio_token_count_over_sample_counts() {
+        // 1 s of audio per chunk pair; 13 output frames per 100 mel frames.
+        let cases = [
+            (240_000usize, 195usize), // 15 s exactly, 1500 mel frames, no remainder
+            (481_473, 392),           // 30.09 s, 3009 frames, remainder 9
+            (1_429_235, 1161),        // 89.33 s, 8932 frames, remainder 32
+            (1_440_000, 1170),        // 90 s exactly
+            (2_820_946, 2292),        // 176.31 s, 17630 frames, remainder 30
+            (2_880_001, 2340),        // 180 s exactly
+            // Short clips: the whole sample is one partial chunk.
+            (16_000, 13),             // 1 s
+            (1_600, 2),               // 0.1 s -> 10 mel frames
+            (160, 1),                 // 1 mel frame
+        ];
+        for (samples, want) in cases {
             let valid = valid_mel_frames(samples);
             assert_eq!(
                 audio_token_count(valid, 50),
                 want,
-                "{clip}: {samples} samples -> {valid} valid mel frames"
+                "{samples} samples -> {valid} valid mel frames"
             );
         }
+    }
+
+    /// Zero frames must not wrap: the chunk arithmetic runs on signed integers
+    /// precisely because `(0 - 1) / 2` has to floor to -1, not underflow.
+    #[test]
+    fn audio_token_count_handles_zero() {
+        assert_eq!(audio_token_count(0, 50), 0);
+        assert_eq!(conv3_length(0), 0);
     }
 
     #[test]

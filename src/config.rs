@@ -351,7 +351,7 @@ mod tests {
         // against.  The original-layout branch is exercised by the inline JSON
         // in `test_parse_hf_native_config_layout`, which needs no checkpoint on
         // disk.
-        let path = crate::gold::model_dir().join("config.json");
+        let path = crate::paths::model_dir().join("config.json");
         if !path.is_file() {
             return;
         }
@@ -388,7 +388,7 @@ mod tests {
     /// every geometry decision downstream is derived from.
     #[test]
     fn test_load_shipped_aligner_config() {
-        let path = crate::gold::model_dir().join("config.json");
+        let path = crate::paths::model_dir().join("config.json");
         if !path.is_file() {
             return;
         }
