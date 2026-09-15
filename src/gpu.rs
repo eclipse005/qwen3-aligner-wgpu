@@ -126,9 +126,9 @@ impl DeviceSelector {
 
 /// Default-selection order: discrete before integrated before virtual/CPU, then
 /// by graphics API.  Vulkan first because it is what this engine is tuned and
-/// verified against (`docs/PORTING.md`: the same 1070 decodes 54 % faster on
-/// Vulkan than on D3D12 here, and one iGPU finished a clip on Vulkan that D3D12
-/// did not finish in nine minutes), then Metal for macOS, then D3D12, then GL.
+/// verified against — the same GTX 1070 decodes 54 % faster on Vulkan than on
+/// D3D12 here, and one iGPU finished a clip on Vulkan that D3D12 did not finish
+/// in nine minutes — then Metal for macOS, then D3D12, then GL.
 fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
     let class = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => 0,
@@ -249,7 +249,7 @@ pub async fn list_devices() -> Vec<DeviceInfo> {
 /// `vulkan:0`, `dx12:1`, …  This is the user-facing list — the runtime is the
 /// axis, the vendor and device class are *information*, because a card of one
 /// vendor is reachable through several runtimes and those are different code
-/// paths (see the module docs and `docs/PORTING.md`).
+/// paths, with different limits to size allocations from.
 #[derive(Debug, Clone)]
 pub struct DeviceTarget {
     /// `<runtime>:<index>`, e.g. `vulkan:1` — feed it back via `--device`.
@@ -447,7 +447,7 @@ impl Gpu {
                 // `gemv` use warp shuffles instead of shared-memory butterflies.
                 // All three are intersected with what the adapter reports, so an
                 // adapter without them still gets a device (callers branch on
-                // `Gpu::features`).  See `docs/wgpu-best-practices-audit.md`.
+                // `Gpu::features`).
                 required_features: features
                     & (wgpu::Features::TIMESTAMP_QUERY
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS

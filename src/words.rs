@@ -1,15 +1,10 @@
 //! Word splitting — the contract that decides timestamp granularity.
 //!
-//! Port of `Qwen3ASRProcessor.split_words_for_alignment`
-//! (`transformers/models/qwen3_asr/processing_qwen3_asr.py`), which is itself a
-//! port of `Qwen3ForceAlignProcessor.encode_timestamp` in
-//! `D:\Qwen3-ASR\qwen_asr\inference\qwen3_forced_aligner.py`.
+//! Per language: Japanese goes through nagisa, Korean splits on whitespace, and
+//! everything else emits one token per CJK character and one per
+//! space-delimited run.
 //!
-//! The two agree on every fixture (the gold generator refuses to freeze a clip
-//! whose word list the two disagree on), so either is a safe spec; this follows
-//! the transformers one because that is the API the gold was produced through.
-//!
-//! Three behaviours here are load-bearing and none are guessable:
+//! Three behaviours are load-bearing and none are guessable:
 //!
 //! * **Japanese is not per-character.**  nagisa's morphemes are the units
 //!   (`女子` / `アナ` / `の` / `仕事`), so `ja` needs a morphological analyser and

@@ -144,8 +144,8 @@ impl Mat {
                     // Four accumulators: a single `s` serialises the FMA chain
                     // on its latency (~4 cycles), which measured 8x off this
                     // machine's f32 throughput.  This changes the summation
-                    // order, which the CPU path is allowed to do — the gate is
-                    // the transcript, not bit-equality (docs/PORTING.md §1.1).
+                    // order, which the CPU path is allowed to do — it is gated
+                    // on the transcript, not on bit-equality with the GPU.
                     let mut a = [0.0f32; 4];
                     let quads = cols / 4;
                     for q in 0..quads {

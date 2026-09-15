@@ -370,7 +370,8 @@ struct Pipes {
 /// Capacity of the single-block attention path — CUDA's `SPLIT_THRESHOLD`.
 pub const GQA_SINGLE_CAP: usize = 1024;
 
-/// Key-slab width for the tiled causal prefill attention (`docs/design-tiled-prefill.md`).
+/// Key-slab width for the tiled causal prefill attention: the key dimension is
+/// processed in windows of this many positions rather than materialised whole.
 const SLAB_T: usize = 1024;
 
 /// Reduction block size for the slabbed softmax and its statistics.
@@ -504,7 +505,7 @@ impl WgpuTextDecoder {
         // `gemv`'s 32-lane xor butterfly can use `subgroupShuffleXor` instead of
         // 5 shared-memory rounds.  Both produce the SAME reduction tree, so the
         // results are bit-identical (A/B: 1.17-1.18x, 0 differing outputs on
-        // 18992 rows) — see `shaders::gemv` and `docs/wgpu-best-practices-audit.md`.
+        // 18992 rows).
         //
         // The capability bit alone is NOT enough: the butterfly folds lane xors
         // 16/8/4/2/1 and maps output rows with `warp = lid >> 5`, i.e. it assumes
@@ -1402,7 +1403,7 @@ impl WgpuTextDecoder {
         let cur16 = cur.div_ceil(16) * 16; // k-side zero pad for the AV GEMM
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
 
-        // Slabbed causal attention (docs/design-tiled-prefill.md): tile the *key*
+        // Slabbed causal attention: tile the *key*
         // dimension so the scratch is `[nqh, mp, T]` instead of `[nqh, mp, cur]`.
         // The flat path's scratch is O(s²) — 4.7 GiB per matrix at 15 minutes,
         // past both VRAM and the per-binding limit — and wgpu's failure mode for
@@ -1762,8 +1763,9 @@ impl WgpuTextDecoder {
                 // while the slab is live, the softmax normalises the slab against
                 // its own max, the AV GEMM turns it into that slab's output, and
                 // `slab_weights` + `slab_merge` combine the slabs weighted by
-                // `exp(m_t − M)·Σexp_t` — the exact per-slab softmax masses.
-                // See docs/design-tiled-prefill.md.
+                // `exp(m_t − M)·Σexp_t` — the exact per-slab softmax masses,
+                // which is what makes the tiling a reassociation rather than an
+                // approximation.
                 let spart = slab_part.as_ref().unwrap();
                 let sstats = slab_stats.as_ref().unwrap();
                 let swt = slab_w.as_ref().unwrap();

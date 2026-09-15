@@ -1,23 +1,12 @@
 //! `align` — forced alignment, and the gate that keeps it honest.
 //!
-//! The production surface is the reference's: an audio file, its transcript, a
-//! language, and out come the words with times.  Everything else — decoding the
-//! wav, the log-mel, the word split, the input assembly, the timestamp repair —
-//! happens inside [`Aligner::align`], so a caller never has to know the model's
-//! plumbing.
-//!
 //! ```text
 //! align --audio speech.wav --text transcript.txt --language English
-//! align --audio speech.wav --text "hello world" --language English --output out.json
-//! align gate --device vulkan --dtype fp32        # the regression gate
-//! align --list-devices
+//! align gate --device vulkan --dtype fp32
 //! ```
 //!
-//! `gate` is separated on purpose.  It needs the frozen gold, the six fixtures
-//! and the FLEURS tree, which a user of the aligner does not have; folding those
-//! flags into the main path is how the previous version of this file ended up
-//! with `--eval`, `--check-input`, `--wav`, `--all`, `--limit` and `--list-clips`
-//! all sitting next to `--audio`.
+//! `gate` is a separate subcommand because it needs the frozen gold, the six
+//! fixtures and the FLEURS tree, which a user of the aligner does not have.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -538,8 +527,7 @@ USAGE:
 
 OPTIONS:
   --model <dir>    checkpoint directory.  Default: `QALIGN_MODEL` if set, else
-                   D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf (where the
-                   ModelScope download in docs/baseline-gold.md puts it).
+                   D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf.
   --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
   --dtype <t>      fp32 (default) | f16 | bf16 — which gold `gate` compares against
 

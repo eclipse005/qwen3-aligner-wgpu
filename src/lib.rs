@@ -4,10 +4,7 @@
 //! Forced alignment is the inverse of transcription: audio *and* its transcript
 //! go in, and out comes where each word sits.  The model is a single causal pass
 //! — no autoregressive loop — so a clip costs one forward, and the alignment is
-//! read off a 5000-way classification head at the positions carrying the
-//! `<timestamp>` marker.
-//!
-//! # Using it
+//! read off a 5000-way classification head at the `<timestamp>` positions.
 //!
 //! ```no_run
 //! use qwen3_aligner_wgpu::align_inference::Aligner;
@@ -15,35 +12,22 @@
 //! # fn main() -> anyhow::Result<()> {
 //! let mut aligner = Aligner::load(DeviceSelector::parse("auto")?, std::path::Path::new("model"))?;
 //! let items = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some("English"))?;
-//! for it in items {
-//!     println!("{}\t{:.3}\t{:.3}", it.text, it.start_time, it.end_time);
-//! }
 //! # Ok(()) }
 //! ```
 //!
-//! [`align_inference`] is the entry point; [`words`], [`align_input`] and
-//! [`postprocess`] are the three pieces of the contract that decide what the
-//! output *is* — how the transcript is split into words, how the sequence is
-//! assembled, and how the model's timestamps are repaired and paired.
+//! [`align_inference`] is the entry point.  [`words`], [`align_input`] and
+//! [`postprocess`] are the three pieces of the output contract: how the
+//! transcript is split, how the sequence is assembled, and how the model's
+//! timestamps are repaired and paired.
 //!
-//! # What came from where
+//! The infrastructure — [`gpu`], [`mel`], [`weights`], the shaders and the two
+//! towers — is lifted from the sibling ASR port (`D:\qwen3-asr-wgpu`), which is
+//! model-independent and was verified there.
 //!
-//! The infrastructure is lifted from the sibling ASR port (`D:\qwen3-asr-wgpu`,
-//! finished and verified there at 12/12) because it is model-independent:
-//! [`gpu`] (device selection, the persisted pipeline cache, staged uploads),
-//! [`mel`] (the torch-compatible log-mel front end and wav loading, with the
-//! vendored soxr HQ resampler), [`weights`] (safetensors/mmapped access in the
-//! f16 word layout), and the shaders, text decoder and audio towers that go with
-//! them.  [`config`], [`cpu_tensor`] and [`mrope`] are the small pieces the
-//! reference paths need.
-//!
-//! # The reference it is gated against
-//!
-//! `transformers`' native `Qwen3ASRForTokenClassification`, run on the `-hf`
-//! checkpoint — **not** the original-layout one, which stores different tensor
-//! names.  The frozen baselines live in `tools/gold/`, and `docs/baseline-gold.md`
-//! records how they were produced, why the timestamp criterion is a *margin* and
-//! not a tolerance, and what is still unverified.
+//! Gated against `transformers`' native `Qwen3ASRForTokenClassification` on the
+//! **`-hf`** checkpoint (`model.audio_tower.*` / `score.weight`), not the
+//! original-layout one.  Baselines are in `tools/gold/`; `src/gold.rs` records
+//! why the timestamp criterion is a margin rather than a tolerance.
 
 pub mod align_inference;
 pub mod align_input;

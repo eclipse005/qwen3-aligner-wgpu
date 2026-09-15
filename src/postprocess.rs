@@ -1,12 +1,7 @@
 //! Timestamp repair and the word/timestamp pairing.
 //!
-//! Port of `_fix_timestamps` in
-//! `transformers/models/qwen3_asr/processing_qwen3_asr.py` (upstream:
-//! `Qwen3ForceAlignProcessor.fix_timestamp`).
-//!
-//! The model emits 5000-way logits per `<timestamp>` token, one class per 80 ms
-//! bucket, and it does **not** guarantee they increase.  Repair is therefore part
-//! of the output contract, not cosmetic:
+//! The head emits one class per 80 ms bucket per `<timestamp>` token, and the
+//! classes do not have to increase.  Repair is part of the output contract:
 //!
 //! 1. Take the longest increasing subsequence (O(n^2) DP) and call those
 //!    timestamps "normal".  Ties are broken by *earliest index*: `max` and
@@ -18,10 +13,9 @@
 //!      value;
 //!    * longer — linearly interpolate `left + (right-left)/(n+1) * k` in f64,
 //!      with `k = 1..n`.
-//! 3. Truncate to integer with `int()`, which is **toward zero**, not `round`.
-//!    The interpolation branch means non-multiples of 80 ms do occur in the gold
-//!    (`180s_zh` has values like 127536 against a mean step), so this truncation
-//!    is on the output path.
+//! 3. Truncate to integer with `int()`, which is **toward zero**, not `round`;
+//!    the interpolation branch makes non-multiples of 80 ms real values on the
+//!    output path.
 //!
 //! Left/right neighbours are read out of `result`, not `data` — identical here
 //! because they are by construction at normal positions and only non-normal

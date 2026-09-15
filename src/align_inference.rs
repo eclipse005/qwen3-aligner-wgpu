@@ -1,14 +1,10 @@
 //! The aligner's forward: audio tower → text prefill → timestamp head.
 //!
-//! This is the thin layer that turns the lifted ASR machinery into the
-//! forced-aligner contract.  Everything expensive is reused verbatim;
-//! what is genuinely new is the *shape of the computation*, not the maths:
-//!
 //! ```text
 //! mel ── GpuAudioEncoder::encode ──▶ [n_audio_tokens, 1024]   (ln_post + proj1+gelu+proj2)
 //! input_ids ── embed_tokens gather ──▶ [seq, 1024]
 //!                                       ↓ scatter the audio rows into the <|audio_pad|> slots
-//!                        WgpuTextDecoder::prefill  (28 qwen3 layers, causal, ONE pass)
+//!                        WgpuTextDecoder::prefill  (28 qwen3 layers, causal, one pass)
 //!                                       ↓
 //!                          final RMSNorm (all seq rows)
 //!                                       ↓
@@ -17,22 +13,13 @@
 //!                              raw_ms = bucket * 80
 //! ```
 //!
-//! Three things differ from the ASR decode path and are the whole reason this
-//! file exists:
+//! Three properties worth knowing before changing anything here:
 //!
-//! 1. **There is no generation loop.**  One prefill, no sampling, no KV-cache
-//!    decode steps.  The KV cache is scratch, not state.
-//! 2. **Position encoding is plain RoPE.**  The `-hf` checkpoint's `text_config`
-//!    declares no `mrope_section` (asserted in `config::tests`), so every RoPE
-//!    dimension must read the same position axis — hence `section = [half, 0, 0]`
-//!    below, which flattens `compute_mrope_cos_sin` back to plain RoPE.
-//! 3. **The head is only evaluated where it is read.**  The reference runs
-//!    `score` over the whole sequence and then masks to the `<timestamp>` rows;
-//!    unread rows cannot change the argmax of read rows, so we score only those
-//!    (1498 of 4589 rows on `180s_zh`).
-//!
-//! The first cut of the head runs on the **host**, deliberately: it needs no new
-//! WGSL, so a wrong timestamp can only come from the towers, not from a kernel.
+//! 1. There is no generation loop — one prefill, no KV-cache decode steps.
+//! 2. Position encoding is **plain RoPE**: every dimension reads the same
+//!    position axis, which is what `section = [half, 0, 0]` below produces.
+//! 3. The head is evaluated only on the `<timestamp>` rows.  Scoring the rest
+//!    cannot change the argmax of the rows that are read.
 
 use std::collections::HashMap;
 use std::path::Path;
