@@ -45,6 +45,27 @@ fn main() -> Result<()> {
     let model_dir = arg_value(&args, "--model")
         .map(PathBuf::from)
         .unwrap_or_else(gold::model_dir);
+
+    // Name the path and say what is wrong with it.  Left to the loader this
+    // surfaces as `os error 3` from several frames down, which says nothing
+    // about which directory was meant or what belongs in it.
+    if !model_dir.is_dir() {
+        bail!(
+            "model directory not found: {}\n  \
+             pass --model <dir>, or set QALIGN_MODEL, or put the checkpoint at \
+             the default location",
+            model_dir.display()
+        );
+    }
+    if !model_dir.join("config.json").is_file() {
+        bail!(
+            "{} does not look like a checkpoint: no config.json in it\n  \
+             expected the `-hf` one (architectures = Qwen3ASRForTokenClassification, \
+             model.audio_tower.* / model.language_model.* / score.weight)",
+            model_dir.display()
+        );
+    }
+
     let device = arg_value(&args, "--device").unwrap_or_else(|| "auto".to_string());
     let selector = DeviceSelector::parse(&device)?;
 
@@ -516,7 +537,9 @@ USAGE:
         Every wgpu adapter, with the limits that decide which kernels run.
 
 OPTIONS:
-  --model <dir>    checkpoint dir   (default: QALIGN_MODEL, else the -hf download)
+  --model <dir>    checkpoint directory.  Default: `QALIGN_MODEL` if set, else
+                   D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf (where the
+                   ModelScope download in docs/baseline-gold.md puts it).
   --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
   --dtype <t>      fp32 (default) | f16 | bf16 — which gold `gate` compares against
 
