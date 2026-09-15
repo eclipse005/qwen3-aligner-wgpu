@@ -345,19 +345,6 @@ impl Aligner {
         Ok((raw_ms, items))
     }
 
-    /// The reference's list form: one `(audio, text, language)` triple per
-    /// sample, one result list each.
-    pub fn align_many(
-        &mut self,
-        requests: &[(std::path::PathBuf, String, Option<String>)],
-    ) -> Result<Vec<Vec<AlignItem>>> {
-        let mut out = Vec::with_capacity(requests.len());
-        for (audio, text, language) in requests {
-            out.push(self.align(audio, text, language.as_deref())?);
-        }
-        Ok(out)
-    }
-
     /// The languages the forced aligner supports — the same set as
     /// `FORCED_ALIGNER_LANGUAGES` in `processing_qwen3_asr.py`, which is where the
     /// reference actually enforces it (`prepare_forced_aligner_inputs` raises on
@@ -405,11 +392,10 @@ impl Aligner {
     /// One sample: mel + a built input sequence in, one raw millisecond value per
     /// timestamp token out (`2 * words` of them, in order).
     ///
-    /// `align()` in the reference takes lists here — `audio: list`, `text: list`,
-    /// `language: list` — and runs them as one padded batch.  This is the
-    /// per-sample primitive that a batch call is built from; see
-    /// [`Self::align_batch`] for why the batching itself is deliberately not a
-    /// padded forward yet.
+    /// The primitive `align` is built on, for a caller driving the stages itself
+    /// — the gate does, so that a divergence can be attributed to a phase.  It
+    /// takes the mel and the assembled input sequence rather than a file, and
+    /// returns the pre-repair milliseconds.
     pub fn align_raw_ms(&mut self, mel: &[f32], valid_frames: usize, input: &AlignerInput) -> Result<Vec<i64>> {
         let t_all = std::time::Instant::now();
         let hs = self.cfg.text_cfg.hidden_size;
@@ -520,49 +506,6 @@ impl Aligner {
         self.timings.head_ms = t.elapsed().as_secs_f64() * 1000.0;
         self.timings.total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
         Ok(raw_ms)
-    }
-
-    /// The reference's batch entry point: many `(mel, words)` pairs in, one
-    /// timestamp list each out.
-    ///
-    /// **This closes the API gap, not the throughput one.**  The reference runs a
-    /// batch as a *single left-padded forward* with an attention mask; our lifted
-    /// `prefill` takes one unpadded sequence and has no mask, so padding would
-    /// mean changing a code path that is currently passing the gate.  Instead the
-    /// samples run one after another and produce *bit-identical* results to
-    /// calling [`Self::align_raw_ms`] in a loop — which is the property that
-    /// matters for correctness, and is what a caller of the batch API is asking
-    /// for.  A padded single forward is a throughput change to make later, behind
-    /// the same gate.
-    pub fn align_batch(&mut self, samples: &[BatchSample]) -> Result<Vec<Vec<i64>>> {
-        let mut out = Vec::with_capacity(samples.len());
-        for s in samples {
-            anyhow::ensure!(
-                s.mel.len() == self.cfg.audio_cfg.num_mel_bins * s.padded_frames(),
-                "sample {}: mel has {} values, expected {}x{}",
-                out.len(),
-                s.mel.len(),
-                self.cfg.audio_cfg.num_mel_bins,
-                s.padded_frames()
-            );
-            out.push(self.align_raw_ms(&s.mel, s.valid_frames, &s.input)?);
-        }
-        Ok(out)
-    }
-}
-
-/// One member of a batch: its mel, how much of that mel is real, and the built
-/// input sequence.  See [`crate::align_input::InputBuilder::build`].
-pub struct BatchSample {
-    pub mel: Vec<f32>,
-    pub valid_frames: usize,
-    pub input: AlignerInput,
-}
-
-impl BatchSample {
-    /// Mel width after the processor's right-pad to a multiple of `n_window*2`.
-    pub fn padded_frames(&self) -> usize {
-        crate::align_input::padded_mel_frames(self.valid_frames, 50)
     }
 }
 
