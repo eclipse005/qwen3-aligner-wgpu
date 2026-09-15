@@ -314,9 +314,22 @@ impl Aligner {
         text: &str,
         language: Option<&str>,
     ) -> Result<(Vec<i64>, Vec<AlignItem>)> {
-        self.check_language(language)?;
         let samples = crate::mel::load_audio_wav(audio, 16000)?;
-        let (mel, _bins, _frames) = crate::mel::mel_features(&samples)?;
+        self.align_samples(&samples, text, language)
+    }
+
+    /// As [`Self::align_with_raw`], for audio the caller already decoded.
+    ///
+    /// `samples` must be mono 16 kHz — the same contract as
+    /// `AudioInput::Waveform16Khz` in the CUDA API.
+    pub fn align_samples(
+        &mut self,
+        samples: &[f32],
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<(Vec<i64>, Vec<AlignItem>)> {
+        self.check_language(language)?;
+        let (mel, _bins, _frames) = crate::mel::mel_features(samples)?;
         let valid = crate::align_input::valid_mel_frames(samples.len());
 
         // The processor right-pads the mel axis to a multiple of `n_window * 2`

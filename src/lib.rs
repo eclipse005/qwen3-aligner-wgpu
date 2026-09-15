@@ -22,6 +22,7 @@ pub mod align_inference;
 pub mod align_input;
 pub mod audio_encoder;
 pub mod audio_encoder_gpu;
+pub mod compat;
 pub mod config;
 pub mod cpu_decoder;
 pub mod cpu_tensor;
