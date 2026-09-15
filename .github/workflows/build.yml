@@ -1,31 +1,44 @@
 name: build
 
+# Tests run on every push and PR: they take seconds and need no checkpoint.
+# Packaging only happens for a release tag, or when asked for by hand.
 on:
   push:
     branches: [master, main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      package:
+        description: Build and upload the three platform binaries
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
-  # The aligner binary is what gets shipped; the library is by-catch.
   BIN: align
+
+# A newer push to the same ref cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The vendored soxr is built by build.rs via cmake, which the runner has.
+      # The vendored soxr is built by build.rs through cmake, which the runner
+      # has; no checkpoint or baseline files are involved.
       - run: cargo test --release --all-targets
 
   package:
     name: ${{ matrix.name }}
     needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.package
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +56,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,19 +64,16 @@ jobs:
       - name: Build
         run: cargo build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
 
-      # Package the binary alone: the checkpoint is ~1.7 GB and licensed
-      # separately, so it is fetched by whoever runs this, not shipped here.
+      # The binary alone.  The checkpoint is ~1.7 GB and licensed separately, so
+      # whoever runs this fetches it; it is not shipped here.  The `ja` feature
+      # is on by default, which embeds a ~17 MB Japanese tokenizer model.
       - name: Package (unix)
         if: runner.os != 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BIN }}-${{ matrix.name }}.tar.gz ${{ env.BIN }}
-          cd ../../..
+        run: tar czf ${{ env.BIN }}-${{ matrix.name }}.tar.gz -C target/${{ matrix.target }}/release ${{ env.BIN }}
       - name: Package (windows)
         if: runner.os == 'Windows'
-        run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" `
-                           -DestinationPath "${{ env.BIN }}-${{ matrix.name }}.zip"
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" -DestinationPath "${{ env.BIN }}-${{ matrix.name }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -88,3 +98,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          generate_release_notes: true
