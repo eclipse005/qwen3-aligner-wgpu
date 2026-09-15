@@ -293,10 +293,13 @@ Two things about *where* it is applied, both learned by getting them wrong:
 * **Only Korean was run over its full split** (382 clips); the other nine
   languages were sampled at 20 each, matching the ASR round's methodology.  Full
   gold for all ten exists on disk and is regenerable.
-* **Audio past ~240 s is unverified for correctness.**  It *runs* (`long_zh`
-  probes at 120 s and 240 s complete), but the reference cannot produce a
-  baseline that long — it OOMs at 240 s on 8 GB, and on CPU as well.  The port's
-  own ceiling for Chinese is around 320 s, where `max_seq = 8192` is reached.
+* **Audio past ~240 s is unverified for correctness.**  It *runs* — probes at
+  120 s and 240 s completed, timestamps reaching the end of the audio — but the
+  reference cannot produce a baseline that long: it OOMs at 240 s on 8 GB, and on
+  CPU too.  The port's own ceiling for Chinese is around 320 s, where
+  `max_seq = 8192` is reached.  The probe clips themselves are not kept: they
+  were 11 MB of audio derived from `D:\qwen-aligner-rs\tmp\align_repro_sleep1005`
+  segments, and `D:\Qwen3-ASR\long_gold.py` rebuilds them from there.
 * **Batching is shape-compatible, not padded.**  `align_batch` loops; the
   reference runs one left-padded forward with an attention mask, which the
   lifted `prefill` does not support.

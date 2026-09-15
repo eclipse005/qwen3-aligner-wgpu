@@ -298,6 +298,22 @@ impl Aligner {
         text: &str,
         language: Option<&str>,
     ) -> Result<Vec<AlignItem>> {
+        Ok(self.align_with_raw(audio, text, language)?.1)
+    }
+
+    /// As [`Self::align`], but also hands back the pre-repair millisecond stream.
+    ///
+    /// The gate needs both axes: the raw argmax is where `margin[i]` is
+    /// meaningful (it describes the reference's choice at position `i`), while
+    /// the repaired values are what a caller sees.  Comparing the *repaired*
+    /// stream against a raw margin is an index mismatch — the repair can move a
+    /// value in from elsewhere — and it reports failures that are not there.
+    pub fn align_with_raw(
+        &mut self,
+        audio: &Path,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<(Vec<i64>, Vec<AlignItem>)> {
         self.check_language(language)?;
         let samples = crate::mel::load_audio_wav(audio, 16000)?;
         let (mel, _bins, _frames) = crate::mel::mel_features(&samples)?;
@@ -312,7 +328,8 @@ impl Aligner {
         let words = crate::words::split_words(text, language)?;
         let input = self.input_builder.build(&words, valid)?;
         let raw_ms = self.align_raw_ms(&mel, valid, &input)?;
-        crate::postprocess::decode_timestamps(&words, &raw_ms)
+        let items = crate::postprocess::decode_timestamps(&words, &raw_ms)?;
+        Ok((raw_ms, items))
     }
 
     /// The reference's list form: one `(audio, text, language)` triple per
