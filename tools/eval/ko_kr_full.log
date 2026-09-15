@@ -1,0 +1,184 @@
+warning: unused import: `anyhow`
+  --> src\decoder.rs:31:14
+   |
+31 | use anyhow::{anyhow, bail, Context, Result};
+   |              ^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary parentheses around method argument
+    --> src\decoder.rs:1177:32
+     |
+1177 |         cp.dispatch_workgroups(((self.cfg.vocab_size / 8) as u32), 1, 1);
+     |                                ^                                ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+1177 -         cp.dispatch_workgroups(((self.cfg.vocab_size / 8) as u32), 1, 1);
+1177 +         cp.dispatch_workgroups((self.cfg.vocab_size / 8) as u32, 1, 1);
+     |
+
+warning: unused variable: `kv_dim`
+   --> src\decoder.rs:461:13
+    |
+461 |         let kv_dim = cfg.kv_dim();
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_kv_dim`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `run_conv_stem`, `run_conv_stem_tail`, `run_transformer`, and `config` are never used
+   --> src\audio_encoder.rs:858:19
+    |
+755 | impl CpuAudioEncoder {
+    | -------------------- methods in this implementation
+...
+858 |     pub(crate) fn run_conv_stem(
+    |                   ^^^^^^^^^^^^^
+...
+869 |     pub(crate) fn run_conv_stem_tail(
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+890 |     pub(crate) fn run_transformer(&self, tokens: &[f32], n_tokens: usize) -> Result<Vec<f32>> {
+    |                   ^^^^^^^^^^^^^^^
+...
+910 |     pub(crate) fn config(&self) -> &AudioEncoderConfig {
+    |                   ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `w_stride` is never read
+   --> src\audio_encoder_gpu.rs:497:5
+    |
+484 | struct ConvLevel {
+    |        --------- field in this struct
+...
+497 |     w_stride: usize,
+    |     ^^^^^^^^
+
+warning: fields `pe_rows` and `n_all` are never read
+   --> src\audio_encoder_gpu.rs:603:5
+    |
+593 | pub struct GpuAudioEncoder {
+    |            --------------- fields in this struct
+...
+603 |     pe_rows: usize,
+    |     ^^^^^^^
+...
+624 |     n_all: [usize; 3],
+    |     ^^^^^
+
+warning: fields `n_chunks` and `s_win` are never read
+   --> src\audio_encoder_gpu.rs:660:5
+    |
+659 | struct Geom {
+    |        ---- fields in this struct
+660 |     n_chunks: usize,
+    |     ^^^^^^^^
+...
+664 |     s_win: usize,
+    |     ^^^^^
+    |
+    = note: `Geom` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `inter_pad` is never read
+   --> src\audio_encoder_gpu.rs:673:5
+    |
+669 | struct LayerCtx<'a> {
+    |        -------- field in this struct
+...
+673 |     inter_pad: usize,
+    |     ^^^^^^^^^
+
+warning: function `conv_out_cols_16` is never used
+    --> src\audio_encoder_gpu.rs:2170:4
+     |
+2170 | fn conv_out_cols_16(k: usize) -> u32 {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `upload_f16_now` is never used
+    --> src\audio_encoder_gpu.rs:2217:4
+     |
+2217 | fn upload_f16_now(gpu: &Gpu, label: &str, v: &[f16]) -> Result<wgpu::Buffer> {
+     |    ^^^^^^^^^^^^^^
+
+warning: calls to `std::mem::drop` with a value that implements `Copy` does nothing
+    --> src\decoder.rs:1231:9
+     |
+1231 |         drop(slice);
+     |         ^^^^^-----^
+     |              |
+     |              argument has type `BufferSlice<'_>`
+     |
+     = note: `#[warn(dropping_copy_types)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+     |
+1231 -         drop(slice);
+1231 +         let _ = slice;
+     |
+
+warning: calls to `std::mem::drop` with a value that implements `Copy` does nothing
+   --> src\gpu.rs:617:9
+    |
+617 |         drop(slice);
+    |         ^^^^^-----^
+    |              |
+    |              argument has type `BufferSlice<'_>`
+    |
+help: use `let _ = ...` to ignore the expression or result
+    |
+617 -         drop(slice);
+617 +         let _ = slice;
+    |
+
+warning: `qwen3-aligner-wgpu` (lib) generated 12 warnings (run `cargo fix --lib -p qwen3-aligner-wgpu` to apply 3 suggestions)
+warning: variable `ts_bad` is assigned to, but never used
+   --> src\bin\align.rs:279:13
+    |
+279 |         let mut ts_bad = 0usize;
+    |             ^^^^^^^^^^
+    |
+    = note: consider using `_ts_bad` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `ts_bad` is never read
+   --> src\bin\align.rs:338:17
+    |
+316 |                 ts_bad += 1;
+    |                 ----------- `ts_bad` is overwritten here before the previous value is read
+...
+338 |                 ts_bad += 1;
+    |                 ^^^^^^^^^^^ this value is reassigned later and never used
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `ts_bad` is never read
+   --> src\bin\align.rs:316:17
+    |
+316 |                 ts_bad += 1;
+    |                 ^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: `qwen3-aligner-wgpu` (bin "align") generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 0.13s
+     Running `target\release\align.exe --eval --device vulkan --lang ko_kr`
+gpu audio encoder: conv 64x50 -> 32x25 -> 16x13 [3200/800/208 pos/chunk, 8-chunk rounds], d_model 1024 / 16h x 64, ffn 4096, out 1024, chunk 100 -> 13 tok, wlen 104
+device : NVIDIA P104-100 (Vulkan, DiscreteGpu) | NVIDIA 572.75 | wg workgroup storage 49152 B, maxStorageBufferBindingSize 2047 MiB
+eval   : D:\qwen-aligner-wgpu\tools\eval
+
+config         language    clips   words raw-exact raw-maxdelta  ts-exact ts-maxdelta     RTFx
+      reference's least-certain position: #10 (word 5 start, margin 0.00781)
+       pos word            ours  gold   delta gold-margin   end    
+        10 물의                69    66       3   0.00781   start  
+      reference's least-certain position: #19 (word 9 end, margin 0.00781)
+       pos word            ours  gold   delta gold-margin   end    
+        19 불리는               82    80       2   0.00781   end    
+ko_kr          Korean        382    5633  373/382      240ms   374/382     240ms    37.40
+
+=== 1 languages, 382 clips, 5633 words ===
+    axis 2  raw argmax    : 373/382 clips exact, worst delta 240ms
+    axis 3  reported      : 374/382 clips exact, worst delta 240ms
+    2 clip(s) beyond one bucket
+  2066447018550590499: ts maxdelta 240ms over 9 words
+  4051161714401520488: ts maxdelta 160ms over 14 words

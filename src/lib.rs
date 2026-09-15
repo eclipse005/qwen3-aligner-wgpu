@@ -18,12 +18,25 @@
 //! the token→word→timestamp decode.  See `HANDOFF.md` for the exact upstream
 //! files those come from and how the gate works.
 
+pub mod align_inference;
+pub mod align_input;
+pub mod audio_encoder;
+pub mod audio_encoder_gpu;
 pub mod config;
+pub mod cpu_decoder;
 pub mod cpu_tensor;
+pub mod decoder;
+pub mod gold;
 pub mod gpu;
 pub mod mel;
 pub mod mrope;
+pub mod postprocess;
+pub mod shaders;
 pub mod weights;
+pub mod words;
 
+pub use gold::{Dtype, GoldJson, Verdict};
 pub use gpu::{list_devices, DeviceInfo, DeviceSelector, Gpu};
 pub use mel::load_audio_wav;
+pub use postprocess::{decode_timestamps, fix_timestamps, AlignItem};
+pub use words::split_words;

@@ -1,0 +1,16 @@
+model sha256 : 00568245ceca5af1991d28562a75fe1ddc9bfeb041c27fda66947ea05c47fb86
+versions     : {'python': '3.10.0', 'torch': '2.8.0+cu128', 'transformers': '5.17.0', 'cuda': '12.8', 'device': 'NVIDIA P104-100', 'capability': [6, 1]}
+sm clock     : NVIDIA P104-100, 1885 MHz, 1911 MHz, 46
+=== 90s_en[bfloat16] (English) ===
+wav        : D:\qwen3-asr-rs\tests\fixtures\90s_en.wav
+transcript : python-hf_0.6B_90s_en.txt
+model      : D:\Qwen3-ASR\models\Qwen3-ForcedAligner-0.6B-tf
+Loading weights:   0%|          | 0/708 [00:00<?, ?it/s]Loading weights:   6%|¨ƒ         | 45/708 [00:00<00:01, 449.01it/s]Loading weights:  13%|¨€¨†        | 91/708 [00:00<00:01, 420.84it/s]Loading weights:  20%|¨€¨        | 139/708 [00:00<00:01, 428.87it/s]Loading weights:  26%|¨€¨€¨ƒ       | 187/708 [00:00<00:01, 434.97it/s]Loading weights:  33%|¨€¨€¨€¨†      | 233/708 [00:00<00:01, 437.25it/s]Loading weights:  39%|¨€¨€¨€¨      | 277/708 [00:00<00:00, 434.84it/s]Loading weights:  45%|¨€¨€¨€¨€¨„     | 321/708 [00:00<00:00, 431.98it/s]Loading weights:  52%|¨€¨€¨€¨€¨€¨‡    | 365/708 [00:00<00:00, 433.25it/s]Loading weights:  58%|¨€¨€¨€¨€¨€¨‚    | 409/708 [00:01<00:01, 156.33it/s]Loading weights:  62%|¨€¨€¨€¨€¨€¨€¨‡   | 441/708 [00:01<00:01, 177.89it/s]Loading weights:  67%|¨€¨€¨€¨€¨€¨€¨ƒ   | 473/708 [00:01<00:01, 196.95it/s]Loading weights:  71%|¨€¨€¨€¨€¨€¨€¨€   | 504/708 [00:01<00:00, 209.86it/s]Loading weights:  75%|¨€¨€¨€¨€¨€¨€¨€¨„  | 534/708 [00:01<00:00, 227.25it/s]Loading weights:  80%|¨€¨€¨€¨€¨€¨€¨€¨  | 564/708 [00:02<00:00, 238.66it/s]Loading weights:  84%|¨€¨€¨€¨€¨€¨€¨€¨€¨… | 593/708 [00:02<00:00, 249.47it/s]Loading weights:  88%|¨€¨€¨€¨€¨€¨€¨€¨€¨‚ | 622/708 [00:02<00:00, 257.04it/s]Loading weights:  92%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨‡| 651/708 [00:02<00:00, 257.42it/s]Loading weights:  96%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨ƒ| 683/708 [00:02<00:00, 269.77it/s]Loading weights: 100%|¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€| 708/708 [00:02<00:00, 274.34it/s]
+timestamp_token_id=151705  timestamp_segment_time=80.0  num_labels=5000
+words      : 249  first=['All', 'right', 'viewers', 'welcome', 'everyone', 'into']  last=['while', 'still', 'leveraging']
+wav        : 1440000 samples @16k (source 48000 Hz, 90.000 s), peak=0.6786
+seq_len    : 1973  audio_tokens=1170  timestamp_tokens=498 (expect 498)
+forward    : 1.735 s   logits (1, 1973, 5000)   NVIDIA P104-100, 1885 MHz, 1911 MHz, 50
+timestamps : 249 words  span 2.000..90.000 s  audio 90.000 s  out-of-range=0
+wrote      : D:\qwen-aligner-wgpu\tools\gold\bf16\90s_en.tsv
+ONE CLIP DONE

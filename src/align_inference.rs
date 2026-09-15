@@ -1,0 +1,438 @@
+//! The aligner's forward: audio tower → text prefill → timestamp head.
+//!
+//! This is the thin layer that turns the lifted ASR machinery into the
+//! forced-aligner contract.  Everything expensive is reused verbatim;
+//! what is genuinely new is the *shape of the computation*, not the maths:
+//!
+//! ```text
+//! mel ── GpuAudioEncoder::encode ──▶ [n_audio_tokens, 1024]   (ln_post + proj1+gelu+proj2)
+//! input_ids ── embed_tokens gather ──▶ [seq, 1024]
+//!                                       ↓ scatter the audio rows into the <|audio_pad|> slots
+//!                        WgpuTextDecoder::prefill  (28 qwen3 layers, causal, ONE pass)
+//!                                       ↓
+//!                          final RMSNorm (all seq rows)
+//!                                       ↓
+//!                 score GEMV on the <timestamp> rows only  (1024 → 5000)
+//!                                       ↓ argmax
+//!                              raw_ms = bucket * 80
+//! ```
+//!
+//! Three things differ from the ASR decode path and are the whole reason this
+//! file exists:
+//!
+//! 1. **There is no generation loop.**  One prefill, no sampling, no KV-cache
+//!    decode steps.  The KV cache is scratch, not state.
+//! 2. **Position encoding is plain RoPE.**  The `-hf` checkpoint's `text_config`
+//!    declares no `mrope_section` (asserted in `config::tests`), so every RoPE
+//!    dimension must read the same position axis — hence `section = [half, 0, 0]`
+//!    below, which flattens `compute_mrope_cos_sin` back to plain RoPE.
+//! 3. **The head is only evaluated where it is read.**  The reference runs
+//!    `score` over the whole sequence and then masks to the `<timestamp>` rows;
+//!    unread rows cannot change the argmax of read rows, so we score only those
+//!    (1498 of 4589 rows on `180s_zh`).
+//!
+//! The first cut of the head runs on the **host**, deliberately: it needs no new
+//! WGSL, so a wrong timestamp can only come from the towers, not from a kernel.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use half::f16;
+use rayon::prelude::*;
+
+use crate::align_input::AlignerInput;
+use crate::audio_encoder_gpu::GpuAudioEncoder;
+use crate::config::AsrConfig;
+use crate::cpu_tensor::{CpuTensor, CpuWeight};
+use crate::decoder::{TextConfig, WgpuTextDecoder};
+use crate::gpu::{DeviceSelector, Gpu};
+use crate::mrope::{compute_mrope_cos_sin, text_positions};
+use crate::weights::{self, RawTensor};
+
+/// Everything the aligner needs from `config.json`.
+pub struct AlignerConfig {
+    pub audio_cfg: crate::config::AudioEncoderConfig,
+    pub text_cfg: TextConfig,
+    pub timestamp_token_id: u32,
+    pub timestamp_segment_time_ms: f64,
+    pub num_labels: usize,
+    pub audio_token_id: u32,
+    pub max_seq: usize,
+}
+
+impl AlignerConfig {
+    pub fn from_model_dir(dir: &Path) -> Result<Self> {
+        let cfg = AsrConfig::from_file(&dir.join("config.json"))?;
+        let head = cfg
+            .align
+            .as_ref()
+            .context("checkpoint has no forced-aligner head (timestamp_token_id missing)")?;
+        Ok(Self {
+            audio_cfg: cfg.thinker_config.audio_config.clone(),
+            text_cfg: TextConfig::from_model_dir(dir)?,
+            timestamp_token_id: head.timestamp_token_id as u32,
+            timestamp_segment_time_ms: head.timestamp_segment_time_ms,
+            num_labels: head.num_labels,
+            audio_token_id: cfg.thinker_config.audio_token_id as u32,
+            max_seq: 8192,
+        })
+    }
+}
+
+/// The two towers, in whichever form the caller asked for.
+///
+/// Only the towers differ between devices.  Everything between them — the
+/// embedding gather, the audio scatter, the final norm, the timestamp head — is
+/// host code and is shared verbatim, which is why this enum has exactly two
+/// methods and no `align` of its own.
+enum Backend {
+    /// `Gpu` is not cloneable and the decoder owns it; the tower borrows.
+    Gpu {
+        encoder: GpuAudioEncoder,
+        decoder: WgpuTextDecoder,
+    },
+    Cpu {
+        encoder: crate::audio_encoder::CpuAudioEncoder,
+        decoder: crate::cpu_decoder::CpuTextDecoder,
+    },
+}
+
+impl Backend {
+    /// Mel in, projected audio frames out — `[n_audio_tokens, hidden]` f16.
+    ///
+    /// The CPU tower computes in f32 (`CpuAudioEncoder::forward ->
+    /// Vec<f32>`), while the text tower on **both** paths takes f16 bytes.  The
+    /// widening is therefore undone here, at the boundary, so the two devices
+    /// hand the text tower the same thing.  Rounding at a different point would
+    /// be a numerical difference at the entrance to the shared half of the graph.
+    fn audio_embeds(&mut self, mel: &[f32], valid_frames: usize) -> Result<Vec<f16>> {
+        match self {
+            Backend::Gpu { encoder, decoder } => {
+                encoder.encode(decoder.gpu(), mel, 128, valid_frames)
+            }
+            Backend::Cpu { encoder, .. } => {
+                let f = encoder.forward(mel, 128, valid_frames)?;
+                Ok(f.into_iter().map(f16::from_f32).collect())
+            }
+        }
+    }
+
+    /// `[seq, hidden]` f16 hidden states after the last text layer.
+    fn text_hidden(&mut self, bytes: &[u8], seq: usize) -> Result<Vec<f16>> {
+        match self {
+            Backend::Gpu { decoder, .. } => {
+                // The ASR path's first decode token is meaningless here; the
+                // layer outputs are what we need and `prefill` exposes them.
+                let _ = decoder.prefill(bytes, seq, 0)?;
+                let buf = decoder
+                    .debug_prefill_h
+                    .as_ref()
+                    .context("prefill did not expose its hidden states")?;
+                decoder.read_f16(buf, seq * decoder.cfg.hidden_size)
+            }
+            Backend::Cpu { decoder, .. } => decoder.prefill_hidden(bytes, seq, 0),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Backend::Gpu { decoder, .. } => decoder.gpu().describe(),
+            Backend::Cpu { decoder, .. } => decoder.describe(),
+        }
+    }
+}
+
+pub struct Aligner {
+    backend: Backend,
+    /// `[vocab, hidden]`, kept on the host: the gather is `n_text_tokens` rows out
+    /// of 152 064, so uploading the table to do it would move 300 MB to read back 1.
+    embed_tokens: RawTensor,
+    /// `[num_labels, hidden]`, host-side for the first cut — see the module note.
+    score: CpuWeight,
+    final_norm: Vec<f32>,
+    cfg: AlignerConfig,
+    pub timings: Timings,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timings {
+    pub mel_ms: f64,
+    pub enc_ms: f64,
+    pub gather_ms: f64,
+    pub prefill_ms: f64,
+    pub head_ms: f64,
+    pub total_ms: f64,
+}
+
+impl Aligner {
+    pub fn load(selector: DeviceSelector, model_dir: &Path) -> Result<Self> {
+        let cfg = AlignerConfig::from_model_dir(model_dir)?;
+        let weights: HashMap<String, RawTensor> = weights::load_tensors(model_dir)?;
+
+        // Plain RoPE: all `head_dim/2` frequencies on axis 0, which is `0..n`.
+        // The `-hf` checkpoint declares no `mrope_section` (asserted in
+        // `config::tests`), so flattening the axis map back to plain RoPE is what
+        // matches it.  Both backends need the same table.
+        let half = cfg.text_cfg.head_dim / 2;
+        let (cos, sin) = compute_mrope_cos_sin(
+            &text_positions(cfg.max_seq),
+            cfg.text_cfg.head_dim,
+            1_000_000.0,
+            &[half, 0, 0],
+            false,
+        );
+        let cos: Vec<f16> = cos.iter().map(|&v| f16::from_f32(v)).collect();
+        let sin: Vec<f16> = sin.iter().map(|&v| f16::from_f32(v)).collect();
+
+        let backend = if matches!(selector, DeviceSelector::Cpu) {
+            let mut decoder = crate::cpu_decoder::CpuTextDecoder::load(
+                model_dir,
+                "thinker.model",
+                cfg.text_cfg.clone(),
+                cfg.max_seq,
+                cfg.max_seq,
+            )?;
+            decoder.set_rope_tables(&cos, &sin);
+            let encoder = crate::audio_encoder::CpuAudioEncoder::load(
+                &weights,
+                "thinker.audio_tower",
+                &cfg.audio_cfg,
+            )?;
+            Backend::Cpu { encoder, decoder }
+        } else {
+            let gpu = pollster::block_on(Gpu::new_with(selector.clone()))
+                .with_context(|| format!("open device {selector:?}"))?;
+            let decoder = WgpuTextDecoder::load(
+                gpu,
+                model_dir,
+                "thinker.model",
+                cfg.text_cfg.clone(),
+                cfg.max_seq,
+                cfg.max_seq,
+            )?;
+            decoder.set_rope_tables(&cos, &sin);
+            let encoder = GpuAudioEncoder::load(
+                decoder.gpu(),
+                &weights,
+                "thinker.audio_tower",
+                &cfg.audio_cfg,
+                cfg.audio_cfg.n_window_infer,
+            )?;
+            Backend::Gpu { encoder, decoder }
+        };
+
+        let embed_tokens = weights
+            .get("thinker.model.embed_tokens.weight")
+            .context("embed_tokens missing")?
+            .clone();
+        let score = CpuWeight {
+            data: weights
+                .get("score.weight")
+                .context("score.weight missing (is this the -hf checkpoint?)")?
+                .to_f32_vec()?,
+            rows: cfg.num_labels,
+            cols: cfg.text_cfg.hidden_size,
+        };
+        if score.data.len() != score.rows * score.cols {
+            bail!(
+                "score.weight has {} values, expected {}x{}",
+                score.data.len(),
+                score.rows,
+                score.cols
+            );
+        }
+        let final_norm = weights
+            .get("thinker.model.norm.weight")
+            .context("final norm weight missing")?
+            .to_f32_vec()?;
+
+        Ok(Self {
+            backend,
+            embed_tokens,
+            score,
+            final_norm,
+            cfg,
+            timings: Timings::default(),
+        })
+    }
+
+    /// Which device the towers are running on.
+    pub fn backend_name(&self) -> &'static str {
+        match &self.backend {
+            Backend::Gpu { .. } => "gpu",
+            Backend::Cpu { .. } => "cpu",
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        self.backend.describe()
+    }
+
+    pub fn config(&self) -> &AlignerConfig {
+        &self.cfg
+    }
+
+    /// One sample: mel + a built input sequence in, one raw millisecond value per
+    /// timestamp token out (`2 * words` of them, in order).
+    ///
+    /// `align()` in the reference takes lists here — `audio: list`, `text: list`,
+    /// `language: list` — and runs them as one padded batch.  This is the
+    /// per-sample primitive that a batch call is built from; see
+    /// [`Self::align_batch`] for why the batching itself is deliberately not a
+    /// padded forward yet.
+    pub fn align_raw_ms(&mut self, mel: &[f32], valid_frames: usize, input: &AlignerInput) -> Result<Vec<i64>> {
+        let t_all = std::time::Instant::now();
+        let hs = self.cfg.text_cfg.hidden_size;
+        let seq = input.seq_len();
+
+        // ---- audio tower ----
+        let t = std::time::Instant::now();
+        let audio = self.backend.audio_embeds(mel, valid_frames)?;
+        self.timings.enc_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if audio.len() != input.n_audio_tokens * self.cfg.audio_cfg.output_dim {
+            bail!(
+                "audio tower returned {} values, expected {}x{}",
+                audio.len(),
+                input.n_audio_tokens,
+                self.cfg.audio_cfg.output_dim
+            );
+        }
+        if self.cfg.audio_cfg.output_dim != hs {
+            bail!(
+                "projector output {} != text hidden {hs}; the scatter needs them equal",
+                self.cfg.audio_cfg.output_dim
+            );
+        }
+
+        // ---- text embeddings + scatter (host) ----
+        let t = std::time::Instant::now();
+        let mut hidden = vec![f16::ZERO; seq * hs];
+        let mut audio_cursor = 0usize;
+        {
+            let mut row = Vec::with_capacity(hs * 2);
+            for (pos, &id) in input.input_ids.iter().enumerate() {
+                let dst = &mut hidden[pos * hs..(pos + 1) * hs];
+                if id == self.cfg.audio_token_id {
+                    let src = &audio[audio_cursor * hs..(audio_cursor + 1) * hs];
+                    dst.copy_from_slice(src);
+                    audio_cursor += 1;
+                } else {
+                    row.clear();
+                    self.embed_tokens.append_f16_row_le(id as usize, hs, &mut row)?;
+                    for (i, c) in row.chunks_exact(2).enumerate() {
+                        dst[i] = f16::from_ne_bytes([c[0], c[1]]);
+                    }
+                }
+            }
+        }
+        if audio_cursor != input.n_audio_tokens {
+            bail!(
+                "scattered {audio_cursor} audio rows but the sequence has {} audio tokens",
+                input.n_audio_tokens
+            );
+        }
+        self.timings.gather_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // ---- 28 text layers, one pass ----
+        let t = std::time::Instant::now();
+        let mut bytes = Vec::with_capacity(hidden.len() * 2);
+        for v in &hidden {
+            bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        drop(hidden);
+        let h = self.backend.text_hidden(&bytes, seq)?;
+        self.timings.prefill_ms = t.elapsed().as_secs_f64() * 1000.0;
+        drop(bytes);
+
+        // ---- final norm + timestamp head (host) ----
+        let t = std::time::Instant::now();
+        let rows: Vec<usize> = input.timestamp_positions.clone();
+        let normed: Vec<f32> = rows
+            .par_iter()
+            .flat_map_iter(|&r| {
+                let row = &h[r * hs..(r + 1) * hs];
+                let mut acc = 0.0f32;
+                for (x, w) in row.iter().zip(&self.final_norm) {
+                    let xf = x.to_f32() * w;
+                    acc += xf * xf;
+                }
+                let inv = 1.0 / (acc / hs as f32 + self.cfg.text_cfg.rms_norm_eps).sqrt();
+                let out: Vec<f32> = row
+                    .iter()
+                    .zip(&self.final_norm)
+                    .map(|(x, w)| x.to_f32() * w * inv)
+                    .collect();
+                out.into_iter()
+            })
+            .collect();
+
+        let n_labels = self.cfg.num_labels;
+        // One batched GEMM instead of a hand-rolled dot-product loop: the loop
+        // measured 29 GFLOPS on 180s_zh (266 ms), which is an order of magnitude
+        // below what the `gemm` crate already reaches in `cpu_tensor::linear`.
+        let normed_t = CpuTensor::new(normed, vec![rows.len(), hs]);
+        let logits = crate::cpu_tensor::linear(&normed_t, &self.score);
+        let raw_ms: Vec<i64> = logits
+            .data
+            .par_chunks_exact(n_labels)
+            .map(|row| {
+                let mut best = 0usize;
+                let mut best_v = f32::NEG_INFINITY;
+                for (l, &v) in row.iter().enumerate() {
+                    if v > best_v {
+                        best_v = v;
+                        best = l;
+                    }
+                }
+                (best as f64 * self.cfg.timestamp_segment_time_ms) as i64
+            })
+            .collect();
+        self.timings.head_ms = t.elapsed().as_secs_f64() * 1000.0;
+        self.timings.total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
+        Ok(raw_ms)
+    }
+
+    /// The reference's batch entry point: many `(mel, words)` pairs in, one
+    /// timestamp list each out.
+    ///
+    /// **This closes the API gap, not the throughput one.**  The reference runs a
+    /// batch as a *single left-padded forward* with an attention mask; our lifted
+    /// `prefill` takes one unpadded sequence and has no mask, so padding would
+    /// mean changing a code path that is currently passing the gate.  Instead the
+    /// samples run one after another and produce *bit-identical* results to
+    /// calling [`Self::align_raw_ms`] in a loop — which is the property that
+    /// matters for correctness, and is what a caller of the batch API is asking
+    /// for.  A padded single forward is a throughput change to make later, behind
+    /// the same gate.
+    pub fn align_batch(&mut self, samples: &[BatchSample]) -> Result<Vec<Vec<i64>>> {
+        let mut out = Vec::with_capacity(samples.len());
+        for s in samples {
+            anyhow::ensure!(
+                s.mel.len() == self.cfg.audio_cfg.num_mel_bins * s.padded_frames(),
+                "sample {}: mel has {} values, expected {}x{}",
+                out.len(),
+                s.mel.len(),
+                self.cfg.audio_cfg.num_mel_bins,
+                s.padded_frames()
+            );
+            out.push(self.align_raw_ms(&s.mel, s.valid_frames, &s.input)?);
+        }
+        Ok(out)
+    }
+}
+
+/// One member of a batch: its mel, how much of that mel is real, and the built
+/// input sequence.  See [`crate::align_input::InputBuilder::build`].
+pub struct BatchSample {
+    pub mel: Vec<f32>,
+    pub valid_frames: usize,
+    pub input: AlignerInput,
+}
+
+impl BatchSample {
+    /// Mel width after the processor's right-pad to a multiple of `n_window*2`.
+    pub fn padded_frames(&self) -> usize {
+        crate::align_input::padded_mel_frames(self.valid_frames, 50)
+    }
+}

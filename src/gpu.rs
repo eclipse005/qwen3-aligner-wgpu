@@ -614,7 +614,8 @@ impl Gpu {
             .context("poll for readback")?;
         rx.recv().context("map callback dropped")?.context("map buffer")?;
         let mut data = slice.get_mapped_range()?.to_vec();
-        drop(slice);
+        // `BufferSlice` is `Copy`, so an explicit `drop` here would be a no-op —
+        // the map is released by `staging.unmap()` below, not by dropping this.
         staging.unmap();
         data.truncate(bytes as usize);
         Ok(data)

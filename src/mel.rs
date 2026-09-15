@@ -5,6 +5,16 @@ pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
 pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 
+/// Log-mel for the aligner: 128 bins, 16 kHz, torch-STFT compatible.
+///
+/// Returns `(mel, num_mel_bins, valid_frames)`, row-major `[bins, frames]`.  The
+/// caller still has to right-pad the time axis to a multiple of `n_window * 2`
+/// with `0.0` — see `align_input::padded_mel_frames` — because that padding is a
+/// processor-level step, not part of the STFT.
+pub fn mel_features(samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
+    MelExtractor::new(N_FFT, HOP_LENGTH, 128, MEL_SAMPLE_RATE).extract(samples)
+}
+
 fn hann_window(n: usize) -> Vec<f32> {
     // Match torch.hann_window(n, periodic=True) used by Qwen3ASRFeatureExtractor.
     (0..n)
@@ -429,7 +439,72 @@ pub fn load_audio_wav(path: impl AsRef<std::path::Path>, target_sr: u32) -> anyh
     load_audio_wav_impl(path.as_ref(), target_sr)
 }
 
+/// Read a plain 16-bit PCM wav straight out of the data chunk.
+///
+/// `hound`'s `into_samples` is a per-sample iterator: 7.8 M `Result` unwraps and
+/// `push`es for the 176 s fixture.  Decoding the bytes in place is the same
+/// arithmetic (`i16 as f32 / 32768.0`, exactly what the iterator path does with
+/// `max_val = 1 << 15`) at a fraction of the cost, so this is a free win with no
+/// numerical consequence.
+///
+/// Returns `None` for anything that is not mono-able 16-bit PCM — float formats,
+/// other bit depths, extensible headers — and the caller falls back to `hound`.
+/// The chunk walk skips unknown chunks and honours the odd-size pad byte.
+fn read_pcm16_fast(path: &std::path::Path) -> Option<(Vec<f32>, u32, usize)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (format, channels, rate, bits)
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.saturating_add(size).min(bytes.len());
+        match id {
+            b"fmt " if size >= 16 => {
+                let f = u16::from_le_bytes(bytes[body_start..body_start + 2].try_into().ok()?);
+                let ch = u16::from_le_bytes(bytes[body_start + 2..body_start + 4].try_into().ok()?);
+                let rate = u32::from_le_bytes(bytes[body_start + 4..body_start + 8].try_into().ok()?);
+                let bits = u16::from_le_bytes(bytes[body_start + 14..body_start + 16].try_into().ok()?);
+                fmt = Some((f, ch, rate, bits));
+            }
+            b"data" => data = Some(&bytes[body_start..body_end]),
+            _ => {}
+        }
+        // Chunks are word-aligned: an odd size carries a pad byte.
+        pos = body_start + size + (size & 1);
+        if pos <= body_start {
+            break;
+        }
+    }
+    let (format, channels, rate, bits) = fmt?;
+    if format != 1 || bits != 16 || channels == 0 || channels > 8 {
+        return None;
+    }
+    let data = data?;
+    let frames = data.len() / (2 * channels as usize);
+    let mut out = Vec::with_capacity(frames);
+    for frame in data[..frames * 2 * channels as usize].chunks_exact(2 * channels as usize) {
+        if channels == 1 {
+            out.push(i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32768.0);
+        } else {
+            let mut acc = 0.0f32;
+            for c in frame.chunks_exact(2) {
+                acc += i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+            }
+            out.push(acc / channels as f32);
+        }
+    }
+    Some((out, rate, channels as usize))
+}
+
 fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result<Vec<f32>> {
+    if let Some((mono, sr, _ch)) = read_pcm16_fast(path) {
+        return finish_audio(mono, sr, target_sr);
+    }
     let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let sr = spec.sample_rate;
@@ -484,10 +559,75 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
             .collect()
     };
 
+    finish_audio(mono, sr, target_sr)
+}
+
+/// Resample if needed.  Shared by the fast and the `hound` path so the two can
+/// only ever differ in how the samples were decoded, never in what follows.
+fn finish_audio(mono: Vec<f32>, sr: u32, target_sr: u32) -> anyhow::Result<Vec<f32>> {
     if sr == target_sr {
         return Ok(mono);
     }
     resample_soxr(&mono, sr, target_sr)
+}
+
+#[cfg(test)]
+mod fast_reader_tests {
+    use super::*;
+
+    /// The fast PCM16 reader must agree with `hound` **bit for bit**, on every
+    /// fixture, at every sample rate and channel count the suite covers.  A
+    /// one-ULP difference here would propagate through soxr into the mel and out
+    /// the other end as a moved timestamp, which is exactly the class of change
+    /// this port refuses to make.
+    #[test]
+    fn fast_pcm16_equals_hound_for_every_fixture() {
+        let dir = crate::gold::fixtures_dir();
+        if !dir.is_dir() {
+            return;
+        }
+        let mut checked = 0usize;
+        for clip in crate::gold::CLIPS {
+            let path = dir.join(format!("{clip}.wav"));
+            if !path.is_file() {
+                continue;
+            }
+            let fast = read_pcm16_fast(&path).map(|(m, _sr, _ch)| m);
+            assert!(fast.is_some(), "{clip}: fast path declined a plain PCM16 wav");
+            let fast = fast.unwrap();
+
+            // The hound path, verbatim, so the comparison is against the code
+            // path the fast reader replaces rather than against a restatement.
+            let reader = hound::WavReader::open(&path).unwrap();
+            let spec = reader.spec();
+            assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+            assert_eq!(spec.bits_per_sample, 16);
+            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            let ch = spec.channels as usize;
+            let raw: Vec<f32> = reader
+                .into_samples::<i32>()
+                .map(|s| s.unwrap() as f32 / max_val)
+                .collect();
+            let slow: Vec<f32> = if ch == 1 {
+                raw
+            } else {
+                raw.chunks(ch)
+                    .map(|c| c.iter().sum::<f32>() / ch as f32)
+                    .collect()
+            };
+
+            assert_eq!(fast.len(), slow.len(), "{clip}: sample count");
+            for (i, (a, b)) in fast.iter().zip(&slow).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{clip}: sample {i} differs: fast={a} hound={b}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no fixtures found under {}", dir.display());
+    }
 }
 
 /// Match Transformers `load_audio` → librosa (`soxr_hq`).

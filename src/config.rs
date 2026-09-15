@@ -5,6 +5,25 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrConfig {
     pub thinker_config: ThinkerConfig,
+    /// Present on forced-aligner checkpoints.  The base model is the same
+    /// `Qwen3ASRForTokenClassification`; this is the timestamp head's geometry.
+    #[serde(skip)]
+    pub align: Option<AlignHeadConfig>,
+}
+
+/// The forced-aligner head: a `Linear(hidden -> num_labels)` scored per
+/// `<timestamp>` position, one class per `timestamp_segment_time` milliseconds.
+#[derive(Debug, Clone)]
+pub struct AlignHeadConfig {
+    /// Token id of `<timestamp>`.  Its *count* in the input is `2 * words`, and
+    /// the model's argmax at those positions is the timestamp stream.
+    pub timestamp_token_id: i64,
+    /// Milliseconds per class.  80 for every shipped checkpoint.
+    pub timestamp_segment_time_ms: f64,
+    /// Output width of the `score` projection (5000).
+    pub num_labels: usize,
+    /// Whether `score` has a bias.  False for this checkpoint.
+    pub token_classification_bias: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +158,16 @@ struct AsrConfigFile {
     audio_start_token_id: Option<i64>,
     #[serde(default)]
     audio_end_token_id: Option<i64>,
+    #[serde(default)]
+    timestamp_token_id: Option<i64>,
+    #[serde(default)]
+    timestamp_segment_time: Option<f64>,
+    #[serde(default)]
+    token_classification_bias: Option<bool>,
+    /// `{"0": "LABEL_0", ..., "4999": "LABEL_4999"}` on the aligner; its length
+    /// is the only place `num_labels` is recorded.
+    #[serde(default)]
+    id2label: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl AsrConfig {
@@ -149,6 +178,12 @@ impl AsrConfig {
 
     fn from_json_str(content: &str) -> anyhow::Result<Self> {
         let raw: AsrConfigFile = serde_json::from_str(content)?;
+        let align = raw.timestamp_token_id.map(|timestamp_token_id| AlignHeadConfig {
+            timestamp_token_id,
+            timestamp_segment_time_ms: raw.timestamp_segment_time.unwrap_or(80.0),
+            num_labels: raw.id2label.as_ref().map(|m| m.len()).unwrap_or(0),
+            token_classification_bias: raw.token_classification_bias.unwrap_or(false),
+        });
         let mut thinker = if let Some(tc) = raw.thinker_config {
             tc
         } else {
@@ -171,7 +206,7 @@ impl AsrConfig {
                 thinker.text_config.rope_theta = theta;
             }
         }
-        Ok(AsrConfig { thinker_config: thinker })
+        Ok(AsrConfig { thinker_config: thinker, align })
     }
 }
 
@@ -335,5 +370,70 @@ mod tests {
             mrope_interleaved: false,
         });
         assert!(!cfg.mrope_interleaved());
+    }
+
+    #[test]
+    fn test_asr_config_has_no_align_head() {
+        let json = r#"{
+            "audio_config": { "encoder_layers": 18 },
+            "text_config": { "hidden_size": 1024 },
+            "audio_token_id": 151676
+        }"#;
+        let cfg = AsrConfig::from_json_str(json).unwrap();
+        assert!(cfg.align.is_none());
+    }
+
+    /// The shipped `-hf` aligner checkpoint, read for real.  This is the config
+    /// every geometry decision downstream is derived from.
+    #[test]
+    fn test_load_shipped_aligner_config() {
+        let path = crate::gold::model_dir().join("config.json");
+        if !path.is_file() {
+            return;
+        }
+        let cfg = AsrConfig::from_file(&path).unwrap();
+        let a = cfg.align.expect("aligner checkpoint must carry an align head");
+
+        assert_eq!(a.timestamp_token_id, 151705);
+        assert_eq!(a.timestamp_segment_time_ms, 80.0);
+        assert_eq!(a.num_labels, 5000);
+        assert!(!a.token_classification_bias);
+
+        assert_eq!(cfg.thinker_config.audio_token_id, 151676);
+        assert_eq!(cfg.thinker_config.audio_start_token_id, 151669);
+        assert_eq!(cfg.thinker_config.audio_end_token_id, 151670);
+
+        // Audio tower: the *0.6B* geometry, not the ASR 0.6B's 896/18/14.
+        let au = &cfg.thinker_config.audio_config;
+        assert_eq!(au.d_model, 1024);
+        assert_eq!(au.encoder_layers, 24);
+        assert_eq!(au.encoder_attention_heads, 16);
+        assert_eq!(au.encoder_ffn_dim, 4096);
+        assert_eq!(au.num_mel_bins, 128);
+        assert_eq!(au.downsample_hidden_size, 480);
+        assert_eq!(au.n_window, 50);
+        assert_eq!(au.n_window_infer, 800);
+        assert_eq!(au.output_dim, 1024);
+
+        // Text tower: qwen3, and the -hf config has no mrope_section at all.
+        let t = &cfg.thinker_config.text_config;
+        assert_eq!(t.hidden_size, 1024);
+        assert_eq!(t.num_hidden_layers, 28);
+        assert_eq!(t.num_attention_heads, 16);
+        assert_eq!(t.num_key_value_heads, 8);
+        assert_eq!(t.head_dim, 128);
+        assert_eq!(t.intermediate_size, 3072);
+        assert_eq!(t.rope_theta, 1_000_000.0);
+        assert!(t.rope_scaling.is_none());
+
+        // …which is exactly why `mrope_section()`'s default must not be trusted.
+        let rope = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rope).unwrap();
+        assert!(
+            v["text_config"].get("rope_scaling").is_none()
+                && v["text_config"]["rope_parameters"].get("mrope_section").is_none(),
+            "if the checkpoint ever starts declaring mrope_section, the text \
+             tower's position encoding changes and this assertion must be revisited"
+        );
     }
 }

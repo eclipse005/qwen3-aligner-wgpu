@@ -1,0 +1,14 @@
+
+
+cmn_hans_cn    Chinese     945 clips  33657 words   154.3s  (0.16s/clip)
+en_us          English     647 clips  14344 words    89.0s  (0.14s/clip)
+ja_jp          Japanese    650 clips  19261 words   115.2s  (0.18s/clip)
+de_de          German      862 clips  18503 words   145.4s  (0.17s/clip)
+es_419         Spanish     908 clips  23260 words   149.0s  (0.16s/clip)
+fr_fr          French      676 clips  16934 words   100.3s  (0.15s/clip)
+it_it          Italian     865 clips  20599 words   156.1s  (0.18s/clip)
+pt_br          Portuguese  919 clips  21271 words   151.8s  (0.17s/clip)
+ru_ru          Russian     775 clips  14937 words   120.7s  (0.16s/clip)
+
+total 7247 clips over 9 languages -> D:\qwen-aligner-wgpu\tools\eval
+

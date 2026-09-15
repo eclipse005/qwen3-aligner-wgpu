@@ -11,6 +11,13 @@ name = "qwen3_aligner_wgpu"
 path = "src/lib.rs"
 
 
+[features]
+default = ["ja"]
+# Japanese word segmentation.  `nagisa_rs` is a path dependency on a sibling
+# checkout (`D:\nagisa-rs`), so it is optional: the crate must still build
+# wherever that tree is absent, just without `--language Japanese`.
+ja = ["dep:nagisa_rs"]
+
 [dependencies]
 wgpu = "30.0.1"
 pollster = "0.4"
@@ -28,6 +35,9 @@ rustfft = "6"
 gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
+unicode-general-category = "1.1.0"
+nagisa_rs = { version = "0.1.0", path = "../nagisa-rs", optional = true }
+thiserror = "2.0.20"
 
 [build-dependencies]
 cmake = "0.1"
