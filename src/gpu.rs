@@ -96,13 +96,6 @@ impl DeviceSelector {
         Ok(Self::Name(s.to_lowercase()))
     }
 
-    fn backends(&self) -> wgpu::Backends {
-        match self {
-            Self::Cpu => wgpu::Backends::empty(),
-            _ => wgpu::Backends::all(),
-        }
-    }
-
     fn matches(&self, info: &wgpu::AdapterInfo) -> bool {
         match self {
             Self::Auto => true,
@@ -110,6 +103,74 @@ impl DeviceSelector {
             Self::Index(_) | Self::Cpu => true,
             Self::Runtime { api, .. } => info.backend == *api,
         }
+    }
+}
+
+/// The runtimes in the order [`rank`] prefers them.
+const API_RANK_ORDER: [wgpu::Backend; 5] = [
+    wgpu::Backend::Vulkan,
+    wgpu::Backend::Metal,
+    wgpu::Backend::Dx12,
+    wgpu::Backend::Gl,
+    wgpu::Backend::BrowserWebGpu,
+];
+
+/// An instance that only knows about `backends`.
+///
+/// `Instance::default()` enables every runtime this build has, and creating it
+/// is where the loaders of those runtimes get loaded: **127 ms** on this machine
+/// against **20 ms** for a Vulkan-only instance (Vulkan's own enumeration is
+/// 2.6 ms, D3D12's is 924 ms — both after the instance exists).  Flags and
+/// backend options stay the defaults `Instance::default()` uses.
+fn instance_for(backends: wgpu::Backends) -> wgpu::Instance {
+    if backends == wgpu::Backends::all() {
+        return wgpu::Instance::default();
+    }
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = backends;
+    wgpu::Instance::new(desc)
+}
+
+/// Adapters `selector` needs to see, gathered no more widely than that.
+///
+/// This is startup cost, and on Windows it is not small: a default instance plus
+/// a D3D12 enumeration is **~1.05 s**, against 20 ms + 2.6 ms for a Vulkan-only
+/// instance — all of it before a single weight is read.  So:
+///
+/// * a named runtime gets an instance of itself and enumerates only itself;
+/// * a raw index or a name substring is defined over the whole list, so those
+///   still take the full instance and the full enumeration;
+/// * `Auto` walks the runtimes in [`rank`] order — instance and all — and stops
+///   as soon as a discrete GPU turns up: a later runtime could then only tie on
+///   device class, and ties go to the earlier runtime, so the pick is the one
+///   the full enumeration would have made.  A machine whose Vulkan has only an
+///   iGPU (or nothing) still walks on, because there D3D12 *can* change the
+///   answer.
+async fn adapters_for(selector: &DeviceSelector) -> Vec<wgpu::Adapter> {
+    match selector {
+        DeviceSelector::Runtime { api, .. } => {
+            let b = wgpu::Backends::from(*api);
+            instance_for(b).enumerate_adapters(b).await
+        }
+        DeviceSelector::Index(_) | DeviceSelector::Name(_) => instance_for(wgpu::Backends::all())
+            .enumerate_adapters(wgpu::Backends::all())
+            .await,
+        DeviceSelector::Auto => {
+            let mut all = Vec::new();
+            for api in API_RANK_ORDER {
+                let b = wgpu::Backends::from(api);
+                let mut found = instance_for(b).enumerate_adapters(b).await;
+                let discrete = found
+                    .iter()
+                    .any(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu);
+                all.append(&mut found);
+                if discrete {
+                    break;
+                }
+            }
+            all
+        }
+        DeviceSelector::Cpu => Vec::new(),
     }
 }
 
@@ -372,8 +433,9 @@ impl Gpu {
                  use WgpuAsr::load_on(.., DeviceSelector::Cpu) or `transcribe --cpu-dec`"
             );
         }
-        let instance = wgpu::Instance::default();
-        let adapters = instance.enumerate_adapters(selector.backends()).await;
+        let t = std::time::Instant::now();
+        let adapters = adapters_for(&selector).await;
+        crate::load_trace::note("gpu: instance + enumerate", t);
         if adapters.is_empty() {
             bail!(
                 "no wgpu adapters found (selector {selector:?}); try listing them first"
@@ -424,6 +486,7 @@ impl Gpu {
         let features = adapter.features();
         let limits = adapter.limits();
 
+        let t = std::time::Instant::now();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("qwen3-aligner-wgpu"),
@@ -442,6 +505,7 @@ impl Gpu {
             })
             .await
             .context("request_device")?;
+        crate::load_trace::note("gpu: request_device", t);
 
         // surface async validation errors / device loss instead of dying later
         // at an unrelated map with a bare "async map a buffer"
@@ -560,11 +624,23 @@ impl Gpu {
     /// Submit an empty command buffer and wait for the queue to drain.  This
     /// retires every deferred `write_buffer` copy and frees their staging.
     pub fn flush(&self) -> Result<()> {
-        let enc = self.device.create_command_encoder(&Default::default());
-        self.queue.submit([enc.finish()]);
+        self.pump()?;
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .context("poll for flush")?;
+        Ok(())
+    }
+
+    /// Submit without waiting.
+    ///
+    /// `queue.write_buffer` only *stages* its copies; they do not start moving
+    /// until the next submission.  A load that stages a whole model and submits
+    /// once therefore leaves the bus idle through every conversion and every
+    /// memcpy and then pays the entire transfer at the end — the pump is what
+    /// lets the DMA of one chunk run against the host preparing the next.
+    pub fn pump(&self) -> Result<()> {
+        let enc = self.device.create_command_encoder(&Default::default());
+        self.queue.submit([enc.finish()]);
         Ok(())
     }
 
@@ -683,26 +759,83 @@ impl<'a> BulkUpload<'a> {
 
     /// Stage `data` into `buf`.  Pieces larger than the budget are split so a
     /// single staging buffer can never exceed it.
+    ///
+    /// Every [`STAGING_BUDGET`] bytes the staged copies are *submitted* — not
+    /// waited on — so their DMA runs while the caller converts and stages the
+    /// next chunk.  Without that the whole transfer lands on the final
+    /// [`Self::finish`]: see [`Gpu::pump`].  The budget is what bounds how much
+    /// can be in flight.
     pub fn upload(&mut self, buf: &wgpu::Buffer, data: &[u8]) -> Result<()> {
+        self.upload_at(buf, 0, data)
+    }
+
+    /// [`Self::upload`] at an explicit offset — so a fused matrix (`q|k|v`,
+    /// `gate|up`) can be written part by part instead of being concatenated on
+    /// the host first.  The offset must be a multiple of 4 (wgpu's copy
+    /// alignment); every f16 row is a multiple of 2, and every call site here
+    /// passes whole matrices.
+    pub fn upload_at(&mut self, buf: &wgpu::Buffer, offset: u64, data: &[u8]) -> Result<()> {
+        anyhow::ensure!(offset % 4 == 0, "upload offset {offset} is not 4-byte aligned");
         let budget = (STAGING_BUDGET as usize).max(1);
-        let mut off = 0usize;
+        let mut off = offset;
         for piece in data.chunks(budget) {
             if self.pending + piece.len() as u64 > STAGING_BUDGET {
-                self.gpu.flush()?;
-                self.pending = 0;
+                self.pump()?;
             }
-            self.gpu.queue.write_buffer(buf, off as u64, piece);
+            let t = std::time::Instant::now();
+            self.gpu.queue.write_buffer(buf, off, piece);
+            crate::load_trace::transfer::add_write(
+                t.elapsed().as_nanos() as u64,
+                piece.len() as u64,
+            );
             self.pending += piece.len() as u64;
-            off += piece.len();
+            off += piece.len() as u64;
         }
         Ok(())
     }
 
-    /// Retire whatever is still staged.  Call before the first real dispatch.
-    pub fn finish(self) -> Result<()> {
-        if self.pending > 0 {
-            self.gpu.flush()?;
+    /// Allocate a storage buffer and fill it from `pieces`, each `(offset, bytes)`.
+    ///
+    /// The pieces come straight out of [`crate::weights`] in the layout the
+    /// kernels want, so a fused matrix is never materialised twice: an f16
+    /// checkpoint contributes its own mapped bytes, a bf16 one a single
+    /// narrowing pass into the destination layout.
+    pub fn upload_pieces(
+        &mut self,
+        label: &str,
+        pieces: &[(u64, bytes::Bytes)],
+    ) -> Result<wgpu::Buffer> {
+        let total: u64 = pieces.iter().map(|(_, b)| b.len() as u64).sum();
+        let buf = self.storage(label, total);
+        for (off, data) in pieces {
+            self.upload_at(&buf, *off, data)?;
         }
+        Ok(buf)
+    }
+
+    /// Retire whatever is still staged.  Call before the first real dispatch.
+    pub fn finish(mut self) -> Result<()> {
+        if self.pending > 0 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Submit the staged copies without waiting for them.
+    fn pump(&mut self) -> Result<()> {
+        let t = std::time::Instant::now();
+        self.gpu.pump()?;
+        crate::load_trace::transfer::add_submit(t.elapsed().as_nanos() as u64);
+        self.pending = 0;
+        Ok(())
+    }
+
+    /// Submit and wait — the last one, where the transfer really is the wait.
+    fn flush(&mut self) -> Result<()> {
+        let t = std::time::Instant::now();
+        self.gpu.flush()?;
+        crate::load_trace::transfer::add_wait(t.elapsed().as_nanos() as u64);
+        self.pending = 0;
         Ok(())
     }
 }

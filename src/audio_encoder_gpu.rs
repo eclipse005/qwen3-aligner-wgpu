@@ -1990,7 +1990,7 @@ fn pad_k(w: &PackedWeight) -> Result<PackedWeight> {
         data.resize(data.len() + (kw - w.cols) * 2, 0);
     }
     Ok(PackedWeight {
-        data,
+        data: data.into(),
         rows: w.rows,
         cols: kw,
     })
@@ -2007,10 +2007,10 @@ fn pad_rows(w: &PackedWeight, new_rows: usize) -> Result<PackedWeight> {
             cols: w.cols,
         });
     }
-    let mut data = w.data.clone();
+    let mut data = w.data.to_vec();
     data.resize(new_rows * w.cols * 2, 0);
     Ok(PackedWeight {
-        data,
+        data: data.into(),
         rows: new_rows,
         cols: w.cols,
     })

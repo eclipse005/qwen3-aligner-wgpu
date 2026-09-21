@@ -38,6 +38,7 @@ pub mod cpu_decoder;
 pub mod cpu_tensor;
 pub mod decoder;
 pub mod gpu;
+pub mod load_trace;
 pub mod mel;
 pub mod mrope;
 pub mod paths;

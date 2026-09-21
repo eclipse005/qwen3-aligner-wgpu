@@ -171,13 +171,26 @@ pub struct Timings {
 
 impl Aligner {
     pub fn load(selector: DeviceSelector, model_dir: &Path) -> Result<Self> {
+        let t = std::time::Instant::now();
         let cfg = AlignerConfig::from_model_dir(model_dir)?;
+        crate::load_trace::note("config", t);
+        // The tokenizer's BPE is a ~270 ms single-threaded JSON parse with nothing
+        // to do with the device, so it parses on its own thread and is joined at
+        // the end — by then it is always ready, and it is off the load's critical
+        // path instead of being 9% of it.
+        let tok_dir = model_dir.to_path_buf();
+        let tok_ts = cfg.timestamp_token_id;
+        let tok_thread =
+            std::thread::spawn(move || crate::align_input::InputBuilder::load(&tok_dir, tok_ts));
+        let t = std::time::Instant::now();
         let weights: HashMap<String, RawTensor> = weights::load_tensors(model_dir)?;
+        crate::load_trace::note("safetensors (mmap + header)", t);
 
         // Plain RoPE: all `head_dim/2` frequencies on axis 0, which is `0..n`.
         // The `-hf` checkpoint declares no `mrope_section` (asserted in
         // `config::tests`), so flattening the axis map back to plain RoPE is what
         // matches it.  Both backends need the same table.
+        let t = std::time::Instant::now();
         let half = cfg.text_cfg.head_dim / 2;
         let (cos, sin) = compute_mrope_cos_sin(
             &text_positions(cfg.max_seq),
@@ -188,6 +201,7 @@ impl Aligner {
         );
         let cos: Vec<f16> = cos.iter().map(|&v| f16::from_f32(v)).collect();
         let sin: Vec<f16> = sin.iter().map(|&v| f16::from_f32(v)).collect();
+        crate::load_trace::note("rope tables", t);
 
         let backend = if matches!(selector, DeviceSelector::Cpu) {
             let mut decoder = crate::cpu_decoder::CpuTextDecoder::load(
@@ -205,8 +219,12 @@ impl Aligner {
             )?;
             Backend::Cpu { encoder, decoder }
         } else {
+            let t = std::time::Instant::now();
             let gpu = pollster::block_on(Gpu::new_with(selector.clone()))
                 .with_context(|| format!("open device {selector:?}"))?;
+            crate::load_trace::note("adapter + device", t);
+            let t = std::time::Instant::now();
+            crate::load_trace::transfer::reset();
             let decoder = WgpuTextDecoder::load(
                 gpu,
                 model_dir,
@@ -215,7 +233,11 @@ impl Aligner {
                 cfg.max_seq,
                 cfg.max_seq,
             )?;
+            crate::load_trace::note("text decoder (incl. pipelines)", t);
+            crate::load_trace::transfer::note("text decoder: transfer");
             decoder.set_rope_tables(&cos, &sin);
+            let t = std::time::Instant::now();
+            crate::load_trace::transfer::reset();
             let encoder = GpuAudioEncoder::load(
                 decoder.gpu(),
                 &weights,
@@ -223,6 +245,8 @@ impl Aligner {
                 &cfg.audio_cfg,
                 cfg.audio_cfg.n_window_infer,
             )?;
+            crate::load_trace::note("gpu audio tower", t);
+            crate::load_trace::transfer::note("gpu audio tower: transfer");
             Backend::Gpu { encoder, decoder }
         };
 
@@ -251,8 +275,11 @@ impl Aligner {
             .context("final norm weight missing")?
             .to_f32_vec()?;
 
-        let input_builder =
-            crate::align_input::InputBuilder::load(model_dir, cfg.timestamp_token_id)?;
+        let t = std::time::Instant::now();
+        let input_builder = tok_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))??;
+        crate::load_trace::note("input builder join (tokenizer)", t);
 
         Ok(Self {
             backend,
