@@ -521,12 +521,12 @@ impl WgpuTextDecoder {
             gemm_causal: build("gemm_causal", &shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl))?,
             gemm_av_causal: build("gemm_av_causal", &shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl))?,
             softmax: std::collections::HashMap::from([
-                (32, build("softmax32", &shaders::softmax_causal(32), "softmax", Some(&sm_pl))?),
-                (64, build("softmax64", &shaders::softmax_causal(64), "softmax", Some(&sm_pl))?),
-                (128, build("softmax128", &shaders::softmax_causal(128), "softmax", Some(&sm_pl))?),
-                (256, build("softmax256", &shaders::softmax_causal(256), "softmax", Some(&sm_pl))?),
-                (512, build("softmax512", &shaders::softmax_causal(512), "softmax", Some(&sm_pl))?),
-                (1024, build("softmax1024", &shaders::softmax_causal(1024), "softmax", Some(&sm_pl))?),
+                (32, build("softmax32", &shaders::softmax_causal(32, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
+                (64, build("softmax64", &shaders::softmax_causal(64, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
+                (128, build("softmax128", &shaders::softmax_causal(128, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
+                (256, build("softmax256", &shaders::softmax_causal(256, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
+                (512, build("softmax512", &shaders::softmax_causal(512, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
+                (1024, build("softmax1024", &shaders::softmax_causal(1024, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
             ]),
             repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
             slab_stats: build(

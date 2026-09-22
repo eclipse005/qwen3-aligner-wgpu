@@ -9,8 +9,7 @@
 use anyhow::{bail, Context, Result};
 
 /// A wgpu device plus the queue, adapter info and negotiated limits.
-pub struct Gpu {
-    pub device: wgpu::Device,
+pub struct Gpu {    pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
@@ -569,6 +568,17 @@ impl Gpu {
             path.display()
         );
         Ok(())
+    }
+
+    /// Whether the reduction kernels may use warp shuffles.
+    ///
+    /// Not just the feature: the shuffles fold lane xors at 16, 8, 4, 2, 1, which
+    /// is a 32-lane butterfly.  An adapter that reports any other subgroup width
+    /// gets the shared-memory tree instead of a wrong answer.
+    pub fn subgroup32(&self) -> bool {
+                self.features.contains(wgpu::Features::SUBGROUP)
+            && self.info.subgroup_min_size == 32
+            && self.info.subgroup_max_size == 32
     }
 
     /// One-line description for logs and reports.

@@ -2076,6 +2076,72 @@ fn prefill_gemm_impl(
     s
 }
 
+/// The tree the engine's shared-memory halving steps leave in lane `i < 32`,
+/// written as one expression: `bs / 32` partials, each the serial sum of one
+/// lane-strided strip, combined exactly as `for sh = bs/2 … 32 { red[i] op=
+/// red[i + sh] }` combines them.
+///
+/// The stride *falls* while the loop runs, so in partial-index space the last
+/// step is the outermost operation — the pairs are `(m, m + k/2)` with `k`
+/// counting *down*.  The same tree read the other way round is the plain halving
+/// tree over **bit-reversed** partial indices, which is what this emits:
+///
+/// ```text
+///   K = 8:  ((p0 p p4) p (p2 p p6)) p ((p1 p p5) p (p3 p p7))
+/// ```
+///
+/// For the sum this is not an equivalent rewrite, it is the same association
+/// spelled out — which is why the shuffle arm is bit-identical.  For the max the
+/// association does not matter (`max` is exact).
+///
+/// Every lane evaluates it (a subgroup shuffle in non-uniform control flow is a
+/// validation error, so the butterfly cannot be guarded), and lanes above 31
+/// read clamped indices: their values are discarded — lane 0 publishes, and the
+/// max is published for everyone — but reading out of the array would not be.
+fn softmax_cross(bs: usize, base: &str, is_max: bool) -> String {
+    fn tree(k: usize, pos: usize, bits: u32, base: &str, is_max: bool, bs: usize) -> String {
+        if k == 1 {
+            // The bit-reversal of `pos` inside `bits`: partial index `m` sits at
+            // position `rev(m)` of the permuted order.
+            let mut m = 0usize;
+            for b in 0..bits {
+                if pos & (1 << b) != 0 {
+                    m |= 1 << (bits - 1 - b);
+                }
+            }
+            return format!("{base}[min(lid.x + {}u, {}u)]", 32 * m, bs - 1);
+        }
+        let a = tree(k / 2, pos, bits, base, is_max, bs);
+        let b = tree(k / 2, pos + k / 2, bits, base, is_max, bs);
+        if is_max {
+            format!("max({a}, {b})")
+        } else {
+            format!("({a} + {b})")
+        }
+    }
+    let k = bs / 32;
+    tree(k, 0, k.trailing_zeros(), base, is_max, bs)
+}
+
+/// The last five halving steps of either tree, as a within-warp XOR butterfly.
+/// For the max every lane ends with the same total; for the sum lane 0 holds
+/// exactly what the shared tree left in `red_sum[0]`, which is the value the
+/// publish step hands to the rest of the workgroup.
+fn softmax_butterfly(is_max: bool, var: &str) -> String {
+    let (open, close) = if is_max {
+        (format!("max({var}, "), ")".to_string())
+    } else {
+        (format!("{var} + "), String::new())
+    };
+    let mut s = String::new();
+    for sh in [16u32, 8, 4, 2, 1] {
+        s.push_str(&format!(
+            "    {var} = {open}subgroupShuffleXor({var}, {sh}u){close};\n"
+        ));
+    }
+    s
+}
+
 /// Causal scaled softmax over prefill scores.  One workgroup per score row; block
 /// size `bs` matches `block_for_reduction(n)` so the reduction trees line up.
 /// Row `p` (of the head) attends `min(p + 1 - row0, valid)` positions; columns
@@ -2084,7 +2150,65 @@ fn prefill_gemm_impl(
 /// `row0` is the column offset of the score block this dispatch covers (0 = the
 /// whole row): the row index is still absolute, so the causal bound is
 /// `p + 1 - row0` clamped at zero.
-pub fn softmax_causal(bs: usize) -> String {
+///
+/// `subgroup` replaces the last five levels of each tree with a
+/// `subgroupShuffleXor` butterfly and the levels above them with one expression
+/// ([`softmax_cross`]), which is the same association and the same numbers:
+/// `examples/attn_sm.rs` checks the two arms word for word (169 M outputs, 0
+/// differ) and prices them (17% of the kernel, which is 12% of a prefill).
+/// Without the feature the shared tree stays as it was.
+pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+    let (max_tree, sum_tree, pub_decl) = if subgroup {
+        (
+            format!(
+                "    var t = {};
+{}
+",
+                softmax_cross(bs, "red_max", true),
+                softmax_butterfly(true, "t")
+            ),
+            format!(
+                "    var u = {};
+{}
+",
+                softmax_cross(bs, "red_sum", false),
+                softmax_butterfly(false, "u")
+            ),
+            "var<workgroup> pub_red: array<f32, 1>;\n",
+        )
+    } else {
+        let steps = |arr: &str, is_max: bool| {
+            // The fallback: the halving tree, one barrier per level.
+            let body = if is_max {
+                format!("red_{arr}[lid.x] = max(red_{arr}[lid.x], red_{arr}[lid.x + sh]);")
+            } else {
+                format!("red_{arr}[lid.x] = red_{arr}[lid.x] + red_{arr}[lid.x + sh];")
+            };
+            format!(
+                "    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+        if (lid.x < sh) {{ {body} }}
+        workgroupBarrier();
+    }}
+"
+            )
+        };
+        (steps("max", true), steps("sum", false), "")
+    };
+    let (max_pub, sum_pub, row_max, inv_sum) = if subgroup {
+        (
+            "    if (lid.x == 0u) { pub_red[0] = t; }\n    workgroupBarrier();\n",
+            "    if (lid.x == 0u) { pub_red[0] = 1.0 / u; }\n    workgroupBarrier();\n",
+            "let row_max = pub_red[0];",
+            "let inv_sum = pub_red[0];",
+        )
+    } else {
+        (
+            "",
+            "",
+            "let row_max = red_max[0];\n    workgroupBarrier();",
+            "let inv_sum = 1.0 / red_sum[0];\n    workgroupBarrier();",
+        )
+    };
     format!(
         "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
 
@@ -2097,7 +2221,7 @@ const BS: u32 = {bs}u;
 {HALF_AT}
 var<workgroup> red_max: array<f32, {bs}>;
 var<workgroup> red_sum: array<f32, {bs}>;
-
+{pub_decl}
 @compute @workgroup_size({bs})
 fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
            @builtin(local_invocation_id) lid: vec3<u32>) {{
@@ -2135,12 +2259,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     red_max[lid.x] = lmax;
     workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
-        if (lid.x < sh) {{ red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + sh]); }}
-        workgroupBarrier();
-    }}
-    let row_max = red_max[0];
-    workgroupBarrier();
+{max_tree}{max_pub}    {row_max}
 
     var lsum = 0.0;
     for (var j = lid.x; j < valid; j = j + BS) {{
@@ -2149,12 +2268,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     red_sum[lid.x] = lsum;
     workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
-        if (lid.x < sh) {{ red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + sh]; }}
-        workgroupBarrier();
-    }}
-    let inv_sum = 1.0 / red_sum[0];
-    workgroupBarrier();
+{sum_tree}{sum_pub}    {inv_sum}
 
     // one thread per f16 word — no read-modify-write races
     for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
