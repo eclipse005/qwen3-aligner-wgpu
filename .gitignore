@@ -25,6 +25,12 @@
 /docs/
 /HANDOFF.md
 
+# local dev tooling: this machine's instruments, kept out of the published tree.
+# The bench/gate scripts and the FMA-wall probe are how the numbers in
+# docs/perf.md were produced, and none of them ship.
+/scripts/*.ps1
+/examples/
+
 # python bytecode, if any tooling is dropped in later
 __pycache__/
 *.pyc
