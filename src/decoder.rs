@@ -105,16 +105,35 @@ fn block_for_reduction(last: usize) -> u32 {
 ///
 /// `SLAB_BS` above already picked 256 for the same reason on the slabbed path.
 ///
-/// `QALIGN_SOFT_BS=<n>` overrides the choice, so the two widths can be compared
-/// on one binary (all six widths are precompiled).
+/// `QALIGN_SOFT_BS=<n>` overrides the choice, so two widths can be compared on one
+/// binary (all six widths are precompiled).
+///
+/// **256, not 128, although 128 measures faster.**  Interleaved A/B on one binary,
+/// three rounds each, prefill medians: 15s_en 181.5 -> 179.1 ms (-1.3%, every 128
+/// run below every 256 run), 90s_ja 1030.6 -> 1020.1 (-1.0%), 180s_zh
+/// 3360.9 -> 3329.0 (-0.9%).  That is a real ~1% and it is *rejected*, because it
+/// costs alignment: against the f16 gold the raw stream goes 3620 exact / 2
+/// excused to 3619 / 3, and items 3619 / 3 to 3617 / 5.  No new hard failure
+/// appears -- every moved endpoint is one the reference itself answers differently
+/// per dtype -- but the diff against the reference grows by two endpoints, and the
+/// standing constraint on this work is that alignment does not move.  A per-row
+/// tie-break the reference cannot decide is not ours to spend.
+///
+/// This is pinned by the gate rather than by a unit test: the numbers above are
+/// what `scripts/bench.ps1` reports against the f16 gold, so a change that moves
+/// the excused count is visible in every run.
 fn softmax_bs(cur: usize) -> u32 {
     if let Ok(s) = std::env::var("QALIGN_SOFT_BS") {
         if let Ok(n) = s.parse::<u32>() {
             return n.clamp(32, 1024);
         }
     }
-    block_for_reduction(cur).min(256)
+    block_for_reduction(cur).min(SOFTMAX_BS_CAP)
 }
+
+/// The flat softmax's block-width cap.  See [`softmax_bs`] for why 256 and not the
+/// faster 128.
+const SOFTMAX_BS_CAP: u32 = 256;
 
 /// Reduction block width for `rms_norm`, by the same argument as [`softmax_bs`].
 ///
