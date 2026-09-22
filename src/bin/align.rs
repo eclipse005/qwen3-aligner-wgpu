@@ -76,8 +76,23 @@ fn main() -> Result<()> {
     );
 
     let t0 = Instant::now();
-    let items = aligner.align(&audio, &text, language.as_deref())?;
+    // `--raw <file>` also dumps the pre-repair millisecond stream.  That stream is
+    // the model's own argmax, one value per timestamp token, before
+    // `fix_timestamps` interpolates and snaps anything — so it is the sharpest
+    // thing to compare against the reference, and the gate uses it when present.
+    let (items, raw) = match arg_value(&args, "--raw") {
+        Some(raw_path) => {
+            let (raw_ms, items) = aligner.align_with_raw(&audio, &text, language.as_deref())?;
+            let json = serde_json::to_string(&raw_ms)?;
+            std::fs::write(&raw_path, json).with_context(|| format!("write {raw_path}"))?;
+            (items, Some(raw_path))
+        }
+        None => (aligner.align(&audio, &text, language.as_deref())?, None),
+    };
     let elapsed = t0.elapsed().as_secs_f64();
+    if let Some(p) = &raw {
+        eprintln!("wrote {p} (raw_ms)");
+    }
 
     match arg_value(&args, "--output") {
         Some(out) => {
@@ -147,4 +162,6 @@ OPTIONS:
   --model <dir>    checkpoint directory; default `QALIGN_MODEL`, else
                    D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf.
   --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
+  --raw <json>     also write the pre-repair millisecond stream (the model's own
+                   argmax, before `fix_timestamps` touches it)
 ";

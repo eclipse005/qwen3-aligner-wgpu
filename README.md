@@ -52,6 +52,7 @@ align --audio speech.wav --text "hello world" --language English --output out.js
 | `--output <json>` | 结果写成 JSON（`text` / `start_time` / `end_time`，单位秒）；不填则按 `词<TAB>开始<TAB>结束` 打印 |
 | `--model <dir>` | 模型目录（也可用环境变量 `QALIGN_MODEL`） |
 | `--device <name>` | 指定设备，默认自动；`cpu` 表示强制用 CPU |
+| `--raw <json>` | 另外写出**修复前**的原始毫秒流（模型自己的 argmax），用于对照参考实现 |
 | `--list-devices` | 列出这台机器上可用的设备 |
 
 ### 作为库
