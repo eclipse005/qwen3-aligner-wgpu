@@ -116,6 +116,30 @@ fn softmax_bs(cur: usize) -> u32 {
     block_for_reduction(cur).min(256)
 }
 
+/// Reduction block width for `rms_norm`, by the same argument as [`softmax_bs`].
+///
+/// `rms_norm` is dispatched twice per layer over `s` rows of `hs = 1024`, so a
+/// 1024-wide block gives each thread **one** element and then charges it a
+/// ten-level tree.  In barrier terms that is worse than the softmax was: 56
+/// dispatches x `s` rows is 257k workgroups at s=4589 against the softmax's 73k,
+/// and every one of them pays its own tree.  The whole `rms_norm` share sits in
+/// the 183.8 ms that `QALIGN_SKIP` leaves unattributed on 180s_en, which is what
+/// bounds the prize at roughly 100 ms.
+///
+/// Same caveat as [`softmax_bs`]: the width sets the summation order, so the
+/// variance moves in the last ulp and the 16-bit write is what absorbs it.  The
+/// gate decides.
+///
+/// `QALIGN_RMS_BS=<n>` overrides, for A/B on one binary.
+fn rms_bs(last: usize) -> u32 {
+    if let Ok(s) = std::env::var("QALIGN_RMS_BS") {
+        if let Ok(n) = s.parse::<u32>() {
+            return n.clamp(32, 1024);
+        }
+    }
+    block_for_reduction(last).min(256)
+}
+
 /// Split a flat workgroup count across two grid axes: `max_compute_workgroups_
 /// per_dimension` caps at 65535, and wgpu rejects the whole command buffer rather
 /// than clamping.
@@ -467,7 +491,7 @@ impl WgpuTextDecoder {
         let wd_pl = family_layout_dyn(&gpu, "widen_dump", &[(0, true), (1, false)], 2, true);
 
         // ── pipelines ─────────────────────────────────────────────────────
-        let rms_bs = block_for_reduction(hs) as usize;
+        let rms_bs = rms_bs(hs) as usize;
         let pipes = Pipes {
             rms_norm: build("rms_norm", &shaders::rms_norm(hs, rms_bs), "rms_norm", None)?,
             extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
