@@ -5,6 +5,21 @@
 /models/
 *.wav
 
+# the frozen reference: this machine's dumps of the Python run it is gated
+# against (6 clips x {fp32,f16,bf16}).  Regenerate with the gold generator; the
+# numbers only mean anything with the same checkpoint hash, which the files
+# record.
+/tools/gold/
+
+# bench harness output (regenerate with scripts/bench.ps1)
+/scripts/bench-*.tsv
+/scripts/*.log
+
+# the measured-performance records -- this machine's numbers, kept out of the
+# published tree
+/docs/
+/HANDOFF.md
+
 # python bytecode, if any tooling is dropped in later
 __pycache__/
 *.pyc
