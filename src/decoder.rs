@@ -346,13 +346,32 @@ const SLAB_BS: usize = 256;
 /// most key slabs a prefill may tile into.  Only the slabbed path uses them.
 const MAX_SLAB: usize = 16;
 
-/// Sequence length above which prefill tiles its attention; below it the flat
-/// path runs.  `QASR_SLAB=on|off` forces one path.
-fn slab_path(s: usize) -> bool {
+/// Whether prefill tiles its attention over the key axis, or materialises the
+/// whole score matrix.  `QASR_SLAB=on|off` forces one path.
+///
+/// The flat path's scratch is `[nqh, mp, cur16]` f32 — O(s²) — and it is also
+/// the faster of the two while it fits: on `180s_zh` (s = 4589) forcing the flat
+/// path was **4.3% faster** (paired A/B over 3 rounds: −3.8 / −4.4 / −4.0%, both
+/// arms passing the gate).
+///
+/// The gate used to be a flat `s > 4096`, which is far below what the hardware
+/// allows — at s = 4589 the scratch is 679 MB against a 2047 MiB binding limit.
+/// So it now tests the constraint that actually exists, and it is a *device*
+/// property rather than a constant: `scores` and `attn` are two separate
+/// buffers of the same size, so the working figure is twice the scratch against
+/// the binding limit.  An adapter with a smaller limit (the integrated Intel
+/// Vulkan device reports 1023 MiB) therefore tiles sooner than this card does,
+/// and the caller's `ensure!` still states the per-buffer bound in full.
+fn slab_path(s: usize, nqh: usize, bind_limit: u64) -> bool {
     match std::env::var("QASR_SLAB").unwrap_or_default().to_ascii_lowercase().as_str() {
         "1" | "on" | "yes" | "force" => true,
         "0" | "off" | "no" => false,
-        _ => s > 4096,
+        _ => {
+            let mp = s.div_ceil(128) * 128;
+            let cur16 = s.div_ceil(16) * 16;
+            let scratch = (nqh * mp * cur16 * 2) as u64; // f32, one buffer
+            scratch.saturating_mul(2) > bind_limit
+        }
     }
 }
 
@@ -813,14 +832,14 @@ impl WgpuTextDecoder {
         // mode for that is garbage rather than an error, so the flat path refuses
         // explicitly.
         let slab_t = SLAB_T;
-        let n_slab = if slab_path(s) { cur.div_ceil(slab_t) } else { 0 };
+        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
+        let n_slab = if slab_path(s, nqh, bind_limit) { cur.div_ceil(slab_t) } else { 0 };
         let slabbed = n_slab > 0;
         // k_rep/v_rep carry whole key slabs on the slabbed path, so their rows
         // cover `n_slab · T` (a little past `cur`); the tail is never *read*
         // meaningfully — the softmax zeroes the columns past the causal bound
         // before the AV GEMM sees them.
         let nkv_rows = if slabbed { n_slab * slab_t } else { np };
-        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
         if slabbed {
             anyhow::ensure!(
                 n_slab <= MAX_SLAB,
