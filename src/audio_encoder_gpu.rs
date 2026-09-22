@@ -53,6 +53,17 @@ const MAX_GEMMS: usize = 256;
 /// Chunks processed per conv-stem round.  The im2col operand is ~9× the
 /// activation it produces, so tiling the chunk axis bounds the stem's buffers.
 const CONV_TILE: usize = 8;
+
+/// Layers per submit in the transformer stack.
+///
+/// A submit is a round trip to the GPU (`QALIGN_ENC_SKIP=<every group>` prices
+/// the whole encode's 11 submits at 49.1 ms on 180s_zh, 3.5% of `enc`), so the
+/// fewer the better -- but the stack cannot be one unbounded submit because
+/// each `dispatch_gemm` claims a `GDims` slot out of `MAX_GEMMS`.  The stack
+/// spends 6 slots per layer (qkv, scores, av, o, fc1, fc2), so 42 layers fill
+/// the ring and this constant only has to stay under that: 12 keeps two submits
+/// for the 24-layer tower and leaves the same headroom for a stack that grows.
+const SUBMIT_EVERY: usize = 12;
 /// `CONV_TILE`, published for the diagnostic's round bookkeeping.
 pub fn conv_tile() -> usize {
     CONV_TILE
@@ -1255,7 +1266,14 @@ impl GpuAudioEncoder {
                     });
                 }
             }
-            if !capture && (li + 1) % 6 == 0 && li + 1 < self.layers.len() {
+            // `SUBMIT_EVERY` layers per submit.  The reason a cadence exists at
+            // all is `MAX_GEMMS` (`gd_slot`): every `dispatch_gemm` in a submit
+            // takes its own 256-byte cfg slot, the stack spends 6 per layer
+            // (qkv, scores, av, o, fc1, fc2), so 42 layers fit one submit and
+            // the whole 24-layer stack fits with room to spare.  Each submit
+            // costs a round trip to the GPU on this driver, which
+            // `QALIGN_ENC_SKIP=<every group>` prices at 49.1 ms on 180s_zh.
+            if !capture && (li + 1) < self.layers.len() && (li + 1) % SUBMIT_EVERY == 0 {
                 gpu.queue.submit([enc.finish()]);
                 gpu.device
                     .poll(wgpu::PollType::wait_indefinitely())
