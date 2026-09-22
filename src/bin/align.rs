@@ -101,14 +101,19 @@ fn main() -> Result<()> {
 
     let tm = aligner.timings;
     eprintln!(
-        "{} items in {:.3}s  (wav+mel+decode {:.1} / enc {:.1} / gather {:.1} / prefill {:.1} / head {:.1} ms)",
+        "{} items in {:.3}s  (wav {:.1} / mel {:.1} / words {:.1} / build {:.1} / enc {:.1} / \
+         gather {:.1} / prefill {:.1} / head {:.1} / post {:.1} ms)",
         items.len(),
         elapsed,
-        elapsed * 1000.0 - tm.total_ms,
+        tm.wav_ms,
+        tm.mel_ms,
+        tm.words_ms,
+        tm.build_ms,
         tm.enc_ms,
         tm.gather_ms,
         tm.prefill_ms,
         tm.head_ms,
+        tm.post_ms,
     );
     Ok(())
 }

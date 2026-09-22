@@ -159,13 +159,28 @@ pub struct Aligner {
     pub timings: Timings,
 }
 
+/// One row per phase, so no time falls between the buckets.
+///
+/// `total_ms` is the model forward only (`enc .. head`); everything the caller
+/// pays outside it has its own field, and the CLI prints them all.  A residual
+/// with no name is where optimisations go to hide, so there is none.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Timings {
+    /// `load_audio_wav`: read, PCM decode, downmix, and resample if the source
+    /// is not already 16 kHz.
+    pub wav_ms: f64,
+    /// `mel_features`: the log-mel STFT.
     pub mel_ms: f64,
+    /// `split_words`: the transcript's word segmentation (nagisa for Japanese).
+    pub words_ms: f64,
+    /// `InputBuilder::build`: tokenise and assemble the model's input sequence.
+    pub build_ms: f64,
     pub enc_ms: f64,
     pub gather_ms: f64,
     pub prefill_ms: f64,
     pub head_ms: f64,
+    /// `decode_timestamps`: repair the raw buckets and pair them with the words.
+    pub post_ms: f64,
     pub total_ms: f64,
 }
 
@@ -338,7 +353,9 @@ impl Aligner {
         text: &str,
         language: Option<&str>,
     ) -> Result<(Vec<i64>, Vec<AlignItem>)> {
+        let t = std::time::Instant::now();
         let samples = crate::mel::load_audio_wav(audio, 16000)?;
+        self.timings.wav_ms = t.elapsed().as_secs_f64() * 1000.0;
         self.align_samples(&samples, text, language)
     }
 
@@ -351,7 +368,9 @@ impl Aligner {
         language: Option<&str>,
     ) -> Result<(Vec<i64>, Vec<AlignItem>)> {
         self.check_language(language)?;
+        let t = std::time::Instant::now();
         let (mel, _bins, _frames) = crate::mel::mel_features(samples)?;
+        self.timings.mel_ms = t.elapsed().as_secs_f64() * 1000.0;
         let valid = crate::align_input::valid_mel_frames(samples.len());
 
         // The processor right-pads the mel axis to a multiple of `n_window * 2`
@@ -360,10 +379,16 @@ impl Aligner {
         let mut mel = mel;
         mel.resize(self.cfg.audio_cfg.num_mel_bins * padded, 0.0);
 
+        let t = std::time::Instant::now();
         let words = crate::words::split_words(text, language)?;
+        self.timings.words_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
         let input = self.input_builder.build(&words, valid)?;
+        self.timings.build_ms = t.elapsed().as_secs_f64() * 1000.0;
         let raw_ms = self.align_raw_ms(&mel, valid, &input)?;
+        let t = std::time::Instant::now();
         let items = crate::postprocess::decode_timestamps(&words, &raw_ms)?;
+        self.timings.post_ms = t.elapsed().as_secs_f64() * 1000.0;
         Ok((raw_ms, items))
     }
 
