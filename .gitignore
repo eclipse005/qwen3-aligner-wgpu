@@ -11,6 +11,11 @@
 # record.
 /tools/gold/
 
+# activation dumps for the value-level comparison against torch (about 1 GB for
+# the two longest clips; regenerate with QALIGN_DUMP_LAYERS / QALIGN_DUMP_HEAD
+# and `D:\Qwen3-ASR\dump_ref_intermediates.py`)
+/tools/dump/
+
 # bench harness output (regenerate with scripts/bench.ps1)
 /scripts/bench-*.tsv
 /scripts/*.log
