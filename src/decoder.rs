@@ -89,6 +89,33 @@ fn block_for_reduction(last: usize) -> u32 {
     bs.min(1024).max(32)
 }
 
+/// Reduction block width for the flat path's `softmax_causal`.
+///
+/// Deliberately not `block_for_reduction`: that helper sizes an `rms_norm` tree,
+/// where a wide block is nearly free because each thread does one multiply-add
+/// per element.  A causal softmax row is `cur` wide — 3712 at s=3651 — so a
+/// 1024-wide block gives each thread three elements and then charges it two
+/// ten-level trees, twenty barriers in all.  This card keeps two such blocks per
+/// SM, so when one is at a barrier there is nothing else on that SM to run; with
+/// 256-wide blocks there are eight, and their barriers interleave.
+///
+/// The width is not just a performance knob: it sets the *order* both reductions
+/// sum in, so the f32 result differs in the last ulp.  The softmax writes 16-bit
+/// values, which is what should absorb that — the gate decides, not this comment.
+///
+/// `SLAB_BS` above already picked 256 for the same reason on the slabbed path.
+///
+/// `QALIGN_SOFT_BS=<n>` overrides the choice, so the two widths can be compared
+/// on one binary (all six widths are precompiled).
+fn softmax_bs(cur: usize) -> u32 {
+    if let Ok(s) = std::env::var("QALIGN_SOFT_BS") {
+        if let Ok(n) = s.parse::<u32>() {
+            return n.clamp(32, 1024);
+        }
+    }
+    block_for_reduction(cur).min(256)
+}
+
 /// Split a flat workgroup count across two grid axes: `max_compute_workgroups_
 /// per_dimension` caps at 65535, and wgpu rejects the whole command buffer rather
 /// than clamping.
@@ -1485,7 +1512,7 @@ impl WgpuTextDecoder {
                 }
 
                 // 6. causal softmax, in place on scores
-                let bs = block_for_reduction(cur) as usize;
+                let bs = softmax_bs(cur) as usize;
                 // softmax reads scores, writes straight into the AV input buffer
                 let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("p.sm"),
