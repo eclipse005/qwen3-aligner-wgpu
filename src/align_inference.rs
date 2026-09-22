@@ -193,10 +193,17 @@ impl Aligner {
         // to do with the device, so it parses on its own thread and is joined at
         // the end — by then it is always ready, and it is off the load's critical
         // path instead of being 9% of it.
+        //
+        // The Japanese tagger's embedded model rides along on the same thread,
+        // for the same reason and with a bigger number attached: it is ~451 ms,
+        // and `split_japanese` would otherwise spend it inside the first Japanese
+        // clip's word-splitting phase.
         let tok_dir = model_dir.to_path_buf();
         let tok_ts = cfg.timestamp_token_id;
-        let tok_thread =
-            std::thread::spawn(move || crate::align_input::InputBuilder::load(&tok_dir, tok_ts));
+        let tok_thread = std::thread::spawn(move || {
+            crate::words::warm_japanese_tagger();
+            crate::align_input::InputBuilder::load(&tok_dir, tok_ts)
+        });
         let t = std::time::Instant::now();
         let weights: HashMap<String, RawTensor> = weights::load_tensors(model_dir)?;
         crate::load_trace::note("safetensors (mmap + header)", t);

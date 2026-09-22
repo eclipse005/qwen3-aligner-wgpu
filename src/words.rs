@@ -117,18 +117,40 @@ fn split_korean(text: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "ja")]
-fn split_japanese(text: &str) -> Result<Vec<String>, WordSplitError> {
+fn japanese_tagger() -> Option<&'static nagisa_rs::Tagger> {
     use std::sync::OnceLock;
     static TAGGER: OnceLock<nagisa_rs::Tagger> = OnceLock::new();
-    let tagger = match TAGGER.get() {
-        Some(t) => t,
-        None => {
-            let t = nagisa_rs::Tagger::embedded()
-                .map_err(|_| WordSplitError::JapaneseFeatureDisabled)?;
-            let _ = TAGGER.set(t);
-            TAGGER.get().expect("tagger just set")
-        }
-    };
+    if let Some(t) = TAGGER.get() {
+        return Some(t);
+    }
+    let t = nagisa_rs::Tagger::embedded().ok()?;
+    let _ = TAGGER.set(t);
+    TAGGER.get()
+}
+
+/// Build the Japanese tagger now, on this thread, if this build has one.
+///
+/// `Tagger::embedded()` is a **~451 ms** embedded-model load (measured; see
+/// `probe_japanese_tagger_cost`), and `split_japanese` would otherwise pay it
+/// inside the first Japanese clip — where it is the entire word-splitting cost,
+/// since tagging the 420-character `90s_ja` transcript takes only ~20 ms.
+///
+/// [`crate::align_inference::Aligner::load`] calls this on the thread that loads
+/// the BPE, which is already off the load's critical path (the weight upload is
+/// the long pole), so the model load happens once *before* any clip instead of
+/// once *inside* one.
+#[cfg(feature = "ja")]
+pub fn warm_japanese_tagger() {
+    let _ = japanese_tagger();
+}
+
+/// No-op without the `ja` feature: `split_japanese` fails rather than splits.
+#[cfg(not(feature = "ja"))]
+pub fn warm_japanese_tagger() {}
+
+#[cfg(feature = "ja")]
+fn split_japanese(text: &str) -> Result<Vec<String>, WordSplitError> {
+    let tagger = japanese_tagger().ok_or(WordSplitError::JapaneseFeatureDisabled)?;
     let words = tagger.tagging(text).words;
     Ok(clean_tokens(words.iter().map(|s| s.as_str())))
 }
@@ -237,5 +259,50 @@ mod tests {
     fn korean_keeps_hanja_inside_its_word() {
         // The Chinese path would emit 中 and 國 separately; the Korean path must not.
         assert_eq!(split_words("中國 사람", Some("Korean")).unwrap(), vec!["中國", "사람"]);
+    }
+
+    /// Probe, not a gate: where the Japanese path's time actually goes.
+    ///
+    /// `split_japanese` builds the tagger lazily, on the first call, and the
+    /// aligner calls it once per clip — so the tagger's construction is charged
+    /// to `words_ms` on the one clip that uses it.  If the numbers say the
+    /// construction is the cost, the fix is to warm it at load, off the clip;
+    /// if it is the tagging, the fix has to be somewhere else entirely.
+    ///
+    /// Run with `--nocapture`; it needs the fixture and the frozen gold (for the
+    /// transcript) and skips silently without them.
+    #[cfg(feature = "ja")]
+    #[test]
+    fn probe_japanese_tagger_cost() {
+        use std::time::Instant;
+        let gold = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/gold/fp32/90s_ja.json");
+        if !gold.is_file() {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&gold).map(|s| {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            v["transcript"].as_str().unwrap().to_string()
+        }) else {
+            return;
+        };
+
+        let t = Instant::now();
+        let tagger = nagisa_rs::Tagger::embedded().expect("embedded tagger");
+        let init = t.elapsed();
+        let t = Instant::now();
+        let first = tagger.tagging(&text).words.len();
+        let first_t = t.elapsed();
+        let t = Instant::now();
+        let second = tagger.tagging(&text).words.len();
+        let second_t = t.elapsed();
+        eprintln!(
+            "nagisa probe: {} chars -> {first}/{second} morphemes | \
+             Tagger::embedded() {:.1} ms | first tagging {:.1} ms | second tagging {:.1} ms",
+            text.chars().count(),
+            init.as_secs_f64() * 1000.0,
+            first_t.as_secs_f64() * 1000.0,
+            second_t.as_secs_f64() * 1000.0,
+        );
     }
 }
