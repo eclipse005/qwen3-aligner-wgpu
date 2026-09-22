@@ -17,8 +17,10 @@
 /tools/dump/
 
 # bench harness output (regenerate with scripts/bench.ps1)
-/scripts/bench-*.tsv
+/scripts/*.tsv
 /scripts/*.log
+# scratch: commit messages and one-off notes for local runs
+/scripts/*.txt
 
 # the measured-performance records -- this machine's numbers, kept out of the
 # published tree
