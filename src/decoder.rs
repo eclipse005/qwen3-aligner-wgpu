@@ -1109,6 +1109,46 @@ impl WgpuTextDecoder {
         // Ablation hook (see `encode_step`).
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
 
+        // The other ablation hook: `QALIGN_SKIP=a,b` leaves whole dispatch groups
+        // out of the pass, which prices exactly what it omits.  Prefer it to
+        // `QASR_DUP`, which pays for a dispatch *added* in the middle of a chain
+        // and reads high on a GEMM because of the cache it disturbs on the way in.
+        //
+        // A skipped group's operands go stale, so the result is wrong on purpose:
+        // the clock is the measurement, and the unskipped run is what the gate
+        // judges.  `skipped` is printed at the end — a name that matched nothing
+        // would otherwise be indistinguishable from a group that costs nothing.
+        let skip_list: Vec<String> = std::env::var("QALIGN_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut skipped = 0usize;
+        macro_rules! skip {
+            ($name:literal) => {
+                skip_list.iter().any(|s| s == $name)
+            };
+        }
+        macro_rules! gemm_or_skip {
+            ($name:literal, $($rest:tt)*) => {{
+                if skip!($name) {
+                    skipped += 1;
+                } else {
+                    gemm!($($rest)*);
+                }
+            }};
+        }
+        macro_rules! dispatch {
+            ($name:literal, $cp:ident, $gx:expr, $gy:expr, $gz:expr) => {{
+                if skip!($name) {
+                    skipped += 1;
+                } else {
+                    $cp.dispatch_workgroups($gx, $gy, $gz);
+                }
+            }};
+        }
+
         for (li, layer) in self.layers.iter().enumerate() {
             // 1. rms_norm(h, iln) → normed   [s, hs]
             let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1126,7 +1166,8 @@ impl WgpuTextDecoder {
             cp.dispatch_workgroups(s as u32, 1, 1);
 
             // 2. qkv GEMM  [s, fused] = normed × qkv_wᵀ
-            gemm!(
+            gemm_or_skip!(
+                "qkv",
                 &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
                 s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
                 (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
@@ -1347,7 +1388,8 @@ impl WgpuTextDecoder {
                 // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
                 // batch strides in WORDS (the shader indexes array<u32> directly);
                 // bsc stays in ELEMENTS (the epilogue divides the sum by 2)
-                gemm!(
+                gemm_or_skip!(
+                    "scores",
                     &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
                     s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
                     (np / 128) as u32, (mp / 128) as u32, nqh as u32
@@ -1383,13 +1425,14 @@ impl WgpuTextDecoder {
                 });
                 cp.set_pipeline(&self.pipes.softmax[&bs]);
                 cp.set_bind_group(0, &bg_sm, &[0]);
-                cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+                dispatch!("softmax", cp, softmax_grid.0, softmax_grid.1, 1);
                 if dup == "p_softmax" {
                     cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
                 }
 
                 // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
-                gemm!(
+                gemm_or_skip!(
+                    "av",
                     &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
                     s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
                     1, (mp / 128) as u32, nqh as u32
@@ -1404,7 +1447,8 @@ impl WgpuTextDecoder {
             }
 
             // 8. o projection + residual:  h += attn_flat × o_wᵀ
-            gemm!(
+            gemm_or_skip!(
+                "o",
                 &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
                 s, hs, nqh * hd, hs, 0, 0, 0,
                 (hs / 128) as u32, (mp / 128) as u32, 1
@@ -1429,7 +1473,8 @@ impl WgpuTextDecoder {
             }
 
             // 10. gate/up GEMM → silu → down GEMM + residual
-            gemm!(
+            gemm_or_skip!(
+                "gu",
                 &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
                 s, 2 * inter, hs, 2 * inter, 0, 0, 0,
                 ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
@@ -1451,7 +1496,8 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
             }
 
-            gemm!(
+            gemm_or_skip!(
+                "down",
                 &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
                 s, hs, inter, hs, 0, 0, 0,
                 (hs / 128) as u32, (mp / 128) as u32, 1
@@ -1478,6 +1524,17 @@ impl WgpuTextDecoder {
 
         drop(cp);
         gpu.queue.submit([enc.finish()]);
+
+        // The guard: a name that matched nothing must not look like a group that
+        // costs nothing.
+        if !skip_list.is_empty() {
+            eprintln!(
+                "prefill: QALIGN_SKIP={} skipped {skipped} dispatch(es) over {} layer(s), s={s} \
+                 (0 means no name matched)",
+                skip_list.join(","),
+                self.layers.len(),
+            );
+        }
 
         // The caller reads the hidden states back out of this buffer; it stays
         // alive (stored in the struct) until the next prefill replaces it.
