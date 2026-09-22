@@ -2537,14 +2537,35 @@ fn bias_gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     .to_string()
 }
 
-/// `LayerNorm` over the last dim, one workgroup per row; a single lane runs the
-/// serial two-pass reduction: `mean`, then `var`, then `(x - mean) * inv_std * w + b`.
+/// Rows one `audio_layernorm` workgroup handles.
+///
+/// The reduction passes are still serial — one lane per row, ascending `j`, one
+/// f32 accumulator — because that is the order the engine's outputs were
+/// produced in, and a tree reduction moves the low bits of the mean enough to
+/// move 0.3% of the f16 outputs by a ulp (measured: `examples/enc_ln.rs`).  What
+/// this constant buys is the *memory* side: `ROWS` rows are staged into
+/// workgroup memory by all 256 lanes, so the serial lane reads shared instead of
+/// issuing 512 single-lane 4-byte global loads.  `examples/enc_ln.rs` prices the
+/// three shapes: the one-lane kernel at 2.56 ms, the same kernel reading from
+/// staged rows at 0.66 ms (bit-exact), and a fully parallel tree at 0.14 ms but
+/// 0.335% of the outputs one ulp off.
+pub const AUDIO_LN_ROWS: usize = 8;
+
+/// Words per row the staging buffer holds: `d_model / 2` at `d_model = 1024`,
+/// the audio tower's width (`AudioEncoderConfig::d_model`, asserted at load).
+pub const AUDIO_LN_WORDS: usize = 512;
+
+/// `LayerNorm` over the last dim: `AUDIO_LN_ROWS` rows per workgroup, all lanes
+/// staging the rows into workgroup memory, then one lane per row running the
+/// serial two-pass reduction in ascending order — `mean`, then `var`, then
+/// `(x - mean) * inv_std * w + b` — and all lanes writing.
 ///
 /// Bindings: 0 = src, 1 = weight, 2 = bias, 3 = `LnCfg { d, eps, ... }`, 4 = dst.
 /// (Uniform before storage: wgpu requires the uniform last, so `Dst` takes
 /// binding 4 and the uniform stays at 3.)
 pub fn audio_layernorm() -> String {
-    "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
+    format!(
+        "struct LnCfg {{ d: u32, eps: f32, _a: u32, _b: u32 }};
 
 @group(0) @binding(0) var<storage, read>       Src: array<u32>;
 @group(0) @binding(1) var<storage, read>       Wgt: array<u32>;
@@ -2552,37 +2573,63 @@ pub fn audio_layernorm() -> String {
 @group(0) @binding(3) var<uniform>             cfg: LnCfg;
 @group(0) @binding(4) var<storage, read_write> Dst: array<u32>;
 
-fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.x, v.y, (i & 1u) == 1u); }
+const ROWS: u32 = {rows}u;
+const WORDS: u32 = {words}u;   // d/2: the staging stride, `cfg.d <= 2 * WORDS`
 
-@compute @workgroup_size(1)
-fn layernorm(@builtin(workgroup_id) wid: vec3<u32>) {
+var<workgroup> row: array<u32, {rows} * {words}>;
+var<workgroup> mean: array<f32, {rows}>;
+var<workgroup> inv: array<f32, {rows}>;
+
+fn half_at(v: vec2<f32>, i: u32) -> f32 {{ return select(v.x, v.y, (i & 1u) == 1u); }}
+
+@compute @workgroup_size(256)
+fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) tid: u32) {{
     let d = cfg.d;
-    let base = wid.x * (d / 2u);
-    var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + half_at(unpack_h(Src[base + j / 2u]), j);
-    }
-    mean = mean / f32(d);
-    var var_ = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let x = half_at(unpack_h(Src[base + j / 2u]), j) - mean;
-        var_ = var_ + x * x;
-    }
-    var_ = var_ / f32(d);
-    let inv = 1.0 / sqrt(var_ + cfg.eps);
-    for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
-        let j = w * 2u;
-        let s = unpack_h(Src[base + w]);
+    let words = d / 2u;
+    let r0 = wid.x * ROWS;
+    // 1. every lane: stage this workgroup's rows, one coalesced word per lane.
+    for (var i = tid; i < ROWS * words; i = i + 256u) {{
+        let r = i / words;
+        let w = i % words;
+        row[r * WORDS + w] = Src[(r0 + r) * words + w];
+    }}
+    workgroupBarrier();
+    // 2. one lane per row: the two reduction passes, in ascending order.
+    if (tid < ROWS) {{
+        let base = tid * WORDS;
+        var m = 0.0;
+        for (var j: u32 = 0u; j < d; j = j + 1u) {{
+            m = m + half_at(unpack_h(row[base + j / 2u]), j);
+        }}
+        m = m / f32(d);
+        var v = 0.0;
+        for (var j: u32 = 0u; j < d; j = j + 1u) {{
+            let x = half_at(unpack_h(row[base + j / 2u]), j) - m;
+            v = v + x * x;
+        }}
+        v = v / f32(d);
+        mean[tid] = m;
+        inv[tid] = 1.0 / sqrt(v + cfg.eps);
+    }}
+    workgroupBarrier();
+    // 3. every lane: normalize and write.
+    for (var i = tid; i < ROWS * words; i = i + 256u) {{
+        let r = i / words;
+        let w = i % words;
+        let s = unpack_h(row[r * WORDS + w]);
         let g = unpack_h(Wgt[w]);
         let b = unpack_h(Bia[w]);
-        Dst[base + w] = pack_h(vec2<f32>(
-            (s.x - mean) * inv * g.x + b.x,
-            (s.y - mean) * inv * g.y + b.y,
-        ));
-    }
-}
-"
-    .to_string()
+        let m = mean[r];
+        let iv = inv[r];
+        Dst[(r0 + r) * words + w] =
+            pack_h(vec2<f32>((s.x - m) * iv * g.x + b.x, (s.y - m) * iv * g.y + b.y));
+    }}
+}}
+",
+        rows = AUDIO_LN_ROWS,
+        words = AUDIO_LN_WORDS
+    )
 }
 
 /// Split the fused QKV projection into the attention layouts.
@@ -2603,27 +2650,32 @@ pub fn audio_extract_qkv() -> String {
 @group(0) @binding(5) var<uniform>             cfg: ExCfg;
 
 @compute @workgroup_size(256)
-fn extract(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // gid = (token, head, word inside the head).  The head is its own grid axis
-    // rather than folded into x: `s_pad · nh` exceeds wgpu's 65535-per-dimension
-    // limit at ~6 minutes of audio.
-    let hd2 = cfg.hd / 2u;
-    let tok = gid.x;
+fn extract(@builtin(workgroup_id) wid: vec3<u32>,
+           @builtin(local_invocation_index) tid: u32) {
+    // One workgroup per token: a token row is `nh·hd/2` words (512 at the
+    // tower's shape), so 256 lanes cover it in two passes.
+    //
+    // The grid used to be `(s_pad, nh, hd/2)` -- one *workgroup* per (token,
+    // head, word), which is a workgroup per element: 1.24M workgroups on a
+    // 180 s clip, of which every 256th thread had anything to do.  That is
+    // `QALIGN_ENC_SKIP=split`'s 91 ms -- 6.5% of the audio tower for 30 MB of
+    // traffic per layer (see `docs/perf.md` §3.4).
+    let tok = wid.x;
     if (tok >= cfg.n_tokens) { return; }
-    let head = gid.y;
-    let w = gid.z;
-    if (w >= hd2) { return; }
 
+    let hd2 = cfg.hd / 2u;
+    let n_w = cfg.nh * hd2;
     let dm2 = cfg.dm / 2u;
     let row = tok * (dm2 * 3u);
-    let col = head * hd2 + w;
-    let dst = tok * (cfg.attn_cols / 2u) + col;
+    let dst0 = tok * (cfg.attn_cols / 2u);
 
     // No positional embedding here: it is added to the `conv_out` output by
     // `audio_add_pe`, and adding it twice would be wrong.
-    Q[dst] = Qkv[row + col];
-    K[dst] = Qkv[row + dm2 + col];
-    V[dst] = Qkv[row + dm2 * 2u + col];
+    for (var c: u32 = tid; c < n_w; c = c + 256u) {
+        Q[dst0 + c] = Qkv[row + c];
+        K[dst0 + c] = Qkv[row + dm2 + c];
+        V[dst0 + c] = Qkv[row + dm2 * 2u + c];
+    }
 }
 "
     .to_string()

@@ -610,6 +610,77 @@ struct Geom {
     s_win: usize,
 }
 
+/// `QALIGN_ENC_SKIP=<group>[,…]` — the audio tower's ablation hook, the
+/// counterpart of the decoder's `QALIGN_SKIP` (see `decoder::prefill` for why
+/// omitting a dispatch prices it better than adding one).  A skipped group's
+/// operands go stale, so the *result* is wrong on purpose: the phase clock is
+/// the measurement, and an unskipped run is what the gate judges.
+///
+/// Group names, one per dispatch site in [`GpuAudioEncoder::layer`] plus the
+/// four after the stack: `ln`, `qkv`, `split`, `pack`, `scores`, `sm`, `av`,
+/// `flat`, `o`, `fln`, `fc1`, `gelu`, `fc2`, `lnpost`, `proj1`, `p1gelu`,
+/// `proj2`.
+///
+/// `hit` is the guard the decoder's version learned to need: without it a name
+/// that matched nothing is indistinguishable from a group that costs nothing.
+struct EncSkip {
+    names: Vec<String>,
+    /// One per `names` entry: did any dispatch site claim that group?
+    hit: Vec<std::cell::Cell<bool>>,
+    /// Dispatch sites actually omitted (a per-layer group counts 24 times).
+    sites: std::cell::Cell<usize>,
+}
+
+impl EncSkip {
+    /// Read the environment once per encode; inactive when unset.
+    fn from_env() -> Self {
+        let names: Vec<String> = std::env::var("QALIGN_ENC_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let hit = names.iter().map(|_| std::cell::Cell::new(false)).collect();
+        Self { names, hit, sites: std::cell::Cell::new(0) }
+    }
+
+    /// Does the list name this group?  Records the hit and prices the site.
+    fn matches(&self, name: &str) -> bool {
+        let mut found = false;
+        for (i, n) in self.names.iter().enumerate() {
+            if n == name {
+                self.hit[i].set(true);
+                found = true;
+            }
+        }
+        if found {
+            self.sites.set(self.sites.get() + 1);
+        }
+        found
+    }
+
+    /// One line, printed only when the hook is in use.
+    fn report(&self, blocks: usize, s: usize) {
+        if self.names.is_empty() {
+            return;
+        }
+        let unmatched: Vec<&str> = self
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.hit[*i].get())
+            .map(|(_, n)| n.as_str())
+            .collect();
+        eprintln!(
+            "audio encoder: QALIGN_ENC_SKIP={} skipped {} dispatch site(s) over {blocks} layer(s), \
+             s={s}; unmatched: {}",
+            self.names.join(","),
+            self.sites.get(),
+            if unmatched.is_empty() { "none".to_owned() } else { unmatched.join(",") },
+        );
+    }
+}
+
 /// Per-pass activation buffers, sized to this clip.
 struct LayerCtx<'a> {
     geom: Geom,
@@ -633,6 +704,8 @@ struct LayerCtx<'a> {
     kt: &'a wgpu::Buffer,
     vp: &'a wgpu::Buffer,
     attn_out: &'a wgpu::Buffer,
+    /// Ablation state — see [`EncSkip`].
+    skip: &'a EncSkip,
 }
 
 impl GpuAudioEncoder {
@@ -665,6 +738,14 @@ impl GpuAudioEncoder {
         let conv_out = GpuLinear::load(&mut up, weights, &format!("{prefix}.conv_out"), "enc.co")?;
 
         let mut layers = Vec::with_capacity(cfg.encoder_layers);
+        // The layernorm stages one row in workgroup memory (`AUDIO_LN_WORDS`
+        // 16-bit pairs), so the tower's width has to fit it.
+        anyhow::ensure!(
+            cfg.d_model as usize <= 2 * shaders::AUDIO_LN_WORDS,
+            "audio d_model {} exceeds the layernorm staging ({} words)",
+            cfg.d_model,
+            shaders::AUDIO_LN_WORDS
+        );
         for i in 0..cfg.encoder_layers {
             let p = format!("{prefix}.layers.{i}");
             let l = |s: &str| format!("enc.l{i}.{s}");
@@ -1044,6 +1125,10 @@ impl GpuAudioEncoder {
 
         let mut out = Capture::default();
 
+        // Ablation hook (see [`EncSkip`]).  Parsed here so both the conv stem
+        // and the transformer can be priced against the same list.
+        let skip = EncSkip::from_env();
+
         // ── conv stem: `CONV_TILE` chunks per round, one submit each ──
         // Each round must be its own submit: `u_im`/`u_pm` carry per-round
         // values, and wgpu applies a `write_buffer` at the next submit.
@@ -1058,11 +1143,19 @@ impl GpuAudioEncoder {
                 } else {
                     (&self.act[level - 1], 0)
                 };
-                self.im2col(gpu, &mut enc, level, input, cin0, n);
-                self.gemm_conv(gpu, &mut enc, level);
-                self.bias_gelu(gpu, &mut enc, level);
+                if !skip.matches("im2col") {
+                    self.im2col(gpu, &mut enc, level, input, cin0, n);
+                }
+                if !skip.matches("cgemm") {
+                    self.gemm_conv(gpu, &mut enc, level);
+                }
+                if !skip.matches("cgelu") {
+                    self.bias_gelu(gpu, &mut enc, level);
+                }
             }
-            self.permute(gpu, &mut enc, &packed, ch0, n_total, tpc, cf);
+            if !skip.matches("permute") {
+                self.permute(gpu, &mut enc, &packed, ch0, n_total, tpc, cf);
+            }
             if capture {
                 self.capture_round(gpu, &mut enc, &mut out, ch0, n, &mel_buf)?;
             } else {
@@ -1079,11 +1172,15 @@ impl GpuAudioEncoder {
         // the residual buffer, so `h` must be read back before it runs.
         self.gd_slot.set(0);
         let mut enc = gpu.device.create_command_encoder(&Default::default());
-        self.gemm(
-            gpu, &mut enc, &packed, &self.conv_out.w, &h_raw,
-            n_total, self.conv_out.n_pad, cf, self.conv_out.n_pad, None,
-        );
-        self.add_pe(gpu, &mut enc, &h_raw, &h_buf, s_pad);
+        if !skip.matches("convout") {
+            self.gemm(
+                gpu, &mut enc, &packed, &self.conv_out.w, &h_raw,
+                n_total, self.conv_out.n_pad, cf, self.conv_out.n_pad, None,
+            );
+        }
+        if !skip.matches("pe") {
+            self.add_pe(gpu, &mut enc, &h_raw, &h_buf, s_pad);
+        }
         gpu.queue.submit([enc.finish()]);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1117,6 +1214,7 @@ impl GpuAudioEncoder {
             kt: &kt,
             vp: &vp,
             attn_out: &attn_out,
+            skip: &skip,
         };
         for li in 0..self.layers.len() {
             self.layer(gpu, &mut enc, &ctx, li)?;
@@ -1165,16 +1263,25 @@ impl GpuAudioEncoder {
                 enc = gpu.device.create_command_encoder(&Default::default());
             }
         }
-        self.layernorm(gpu, &mut enc, ctx.h, &self.ln_post, ctx.normed, geom.s);
-        self.gemm(gpu, &mut enc, ctx.normed, &self.proj1.w, &gu, geom.s, self.proj1.n_pad, self.proj1.k, self.proj1.n_pad, None);
-        self.bias_gelu_tensor(
-            gpu, &mut enc, &gu, &self.proj1.bias, &gact, &self.u_sc[4],
-            s_pad * self.proj1.n_pad, self.proj1.n_pad / 2, false,
-        );
-        self.gemm(
-            gpu, &mut enc, &gact, &self.proj2.w, &out_emb, geom.s,
-            self.proj2.n_pad, self.proj2.k, self.proj2.n_pad, Some(&self.proj2.bias),
-        );
+        // ── ln_post + projector ──
+        if !skip.matches("lnpost") {
+            self.layernorm(gpu, &mut enc, ctx.h, &self.ln_post, ctx.normed, geom.s);
+        }
+        if !skip.matches("proj1") {
+            self.gemm(gpu, &mut enc, ctx.normed, &self.proj1.w, &gu, geom.s, self.proj1.n_pad, self.proj1.k, self.proj1.n_pad, None);
+        }
+        if !skip.matches("p1gelu") {
+            self.bias_gelu_tensor(
+                gpu, &mut enc, &gu, &self.proj1.bias, &gact, &self.u_sc[4],
+                s_pad * self.proj1.n_pad, self.proj1.n_pad / 2, false,
+            );
+        }
+        if !skip.matches("proj2") {
+            self.gemm(
+                gpu, &mut enc, &gact, &self.proj2.w, &out_emb, geom.s,
+                self.proj2.n_pad, self.proj2.k, self.proj2.n_pad, Some(&self.proj2.bias),
+            );
+        }
 
         anyhow::ensure!(self.gd_slot.get() <= MAX_GEMMS, "{} GEMM slots > {MAX_GEMMS}", self.gd_slot.get());
         gpu.queue.submit([enc.finish()]);
@@ -1195,6 +1302,7 @@ impl GpuAudioEncoder {
 
         ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
         PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+        skip.report(self.layers.len(), n_total);
         Ok(out)
     }
 
@@ -1249,16 +1357,29 @@ impl GpuAudioEncoder {
         let (nh, hd) = (self.nh, self.hd);
         let wlen = geom.wlen;
 
+        // See [`EncSkip`]: `skip!("…")` is true only for a group named in
+        // `QALIGN_ENC_SKIP`, and an omitted group leaves its dispatch out.
+        let sk = ctx.skip;
+        macro_rules! skip {
+            ($name:literal) => {
+                sk.matches($name)
+            };
+        }
+
         // 1. self_attn_layer_norm
-        self.layernorm(gpu, enc, ctx.h, &l.sln, ctx.normed, s);
+        if !skip!("ln") {
+            self.layernorm(gpu, enc, ctx.h, &l.sln, ctx.normed, s);
+        }
         // 2. fused QKV
-        self.gemm(
-            gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
-            Some(&l.qkv.bias),
-        );
+        if !skip!("qkv") {
+            self.gemm(
+                gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
+                Some(&l.qkv.bias),
+            );
+        }
         // 3. split Q/K/V (PE was already added to the conv_out output by
         //    `add_pe`).
-        {
+        if !skip!("split") {
             gpu.queue.write_buffer(
                 &self.u_ex,
                 0,
@@ -1287,15 +1408,15 @@ impl GpuAudioEncoder {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.extract);
             cp.set_bind_group(0, &bg, &[]);
-            // (token, head, head-word) — `s_pad·nh` would overflow the 65535
-            // per-dimension grid limit for audio longer than ~6 minutes.
-            cp.dispatch_workgroups(ctx.s_pad as u32, nh as u32, (hd / 2) as u32);
+            // One workgroup per token (`shaders::audio_extract_qkv`); `s` is
+            // capped at `MAX_TOKENS`, well inside the per-dimension limit.
+            cp.dispatch_workgroups(s as u32, 1, 1);
         }
         // 4. re-pack into the per-(head, window) blocks the GEMMs can read
         //    with their fixed operand row strides.
         let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
         let n_blocks = nh * geom.n_win;
-        {
+        if !skip!("pack") {
             gpu.queue.write_buffer(
                 &self.u_wp,
                 0,
@@ -1333,7 +1454,7 @@ impl GpuAudioEncoder {
         //    `kam` = hd, so the A row stride is `hd/2` words (Qp's rows) and the
         //    `transb` B row stride is `wpad/2` (Kt's rows) — both block strides
         //    are dense, one block per `z`.
-        {
+        if !skip!("scores") {
             let bsa = wpad * hd / 2;
             let bsb = hd * wpad / 2;
             // `bsc` is in ELEMENTS: the epilogue divides the flat C index by 2.
@@ -1344,7 +1465,7 @@ impl GpuAudioEncoder {
             );
         }
         // 6. windowed softmax (masks the short last window), scores -> probs
-        {
+        if !skip!("sm") {
             gpu.queue.write_buffer(
                 &self.u_sm,
                 0,
@@ -1374,7 +1495,7 @@ impl GpuAudioEncoder {
             cp.dispatch_workgroups((wpad / 128) as u32, n_blocks as u32, 1);
         }
         // 7. AV: `[wpad, hd_pad] = P · Vp`, same block layout.
-        {
+        if !skip!("av") {
             let bsa = wpad * wpad / 2;
             let bsb = wpad * hd_pad / 2;
             // Elements, like the scores GEMM's `bsc` above.
@@ -1385,7 +1506,7 @@ impl GpuAudioEncoder {
             );
         }
         // 8. compress the blocks into `[tok, nh·hd]`
-        {
+        if !skip!("flat") {
             gpu.queue.write_buffer(
                 &self.u_cp,
                 0,
@@ -1415,7 +1536,9 @@ impl GpuAudioEncoder {
             cp.dispatch_workgroups((ctx.s_pad * ctx.acols / 2).div_ceil(256) as u32, 1, 1);
         }
         // 9. out_proj, added onto the residual (`beta = 1`)
-        self.gemm_beta(gpu, enc, ctx.attn_flat, &l.o.w, ctx.h, s, l.o.n_pad, l.o.k, dm, Some(&l.o.bias));
+        if !skip!("o") {
+            self.gemm_beta(gpu, enc, ctx.attn_flat, &l.o.w, ctx.h, s, l.o.n_pad, l.o.k, dm, Some(&l.o.bias));
+        }
         if self.mid_capture.get() && li == 0 {
             let cb = std::mem::replace(enc, gpu.device.create_command_encoder(&Default::default()));
             gpu.queue.submit([cb.finish()]);
@@ -1424,14 +1547,22 @@ impl GpuAudioEncoder {
                 .map_err(|e| anyhow::anyhow!("audio encoder: device lost at mid capture: {e:?}"))?;
             *self.mid_h.borrow_mut() = Some(read_f16_buf(gpu, ctx.h, ctx.s_pad * dm)?);
         }
-        // 9. final_layer_norm -> FFN (fc1, GELU, fc2) + residual
-        self.layernorm(gpu, enc, ctx.h, &l.fln, ctx.norm2, s);
-        self.gemm(gpu, enc, ctx.norm2, &l.fc1.w, ctx.gu, s, l.fc1.n_pad, l.fc1.k, l.fc1.n_pad, None);
-        self.bias_gelu_tensor(
-            gpu, enc, ctx.gu, &l.fc1.bias, ctx.act, &self.u_sc[3],
-            ctx.s_pad * l.fc1.n_pad, l.fc1.n_pad / 2, false,
-        );
-        self.gemm_beta(gpu, enc, ctx.act, &l.fc2.w, ctx.h, s, l.fc2.n_pad, l.fc2.k, dm, Some(&l.fc2.bias));
+        // 10. final_layer_norm -> FFN (fc1, GELU, fc2) + residual
+        if !skip!("fln") {
+            self.layernorm(gpu, enc, ctx.h, &l.fln, ctx.norm2, s);
+        }
+        if !skip!("fc1") {
+            self.gemm(gpu, enc, ctx.norm2, &l.fc1.w, ctx.gu, s, l.fc1.n_pad, l.fc1.k, l.fc1.n_pad, None);
+        }
+        if !skip!("gelu") {
+            self.bias_gelu_tensor(
+                gpu, enc, ctx.gu, &l.fc1.bias, ctx.act, &self.u_sc[3],
+                ctx.s_pad * l.fc1.n_pad, l.fc1.n_pad / 2, false,
+            );
+        }
+        if !skip!("fc2") {
+            self.gemm_beta(gpu, enc, ctx.act, &l.fc2.w, ctx.h, s, l.fc2.n_pad, l.fc2.k, dm, Some(&l.fc2.bias));
+        }
         Ok(())
     }
 
@@ -1849,7 +1980,10 @@ impl GpuAudioEncoder {
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.layernorm);
         cp.set_bind_group(0, &bg, &[]);
-        cp.dispatch_workgroups(align(rows, GEMM_BM) as u32, 1, 1);
+        // `AUDIO_LN_ROWS` rows per workgroup.  The grid still covers the same
+        // padded rows the row-per-workgroup form did: `align(rows, GEMM_BM)` is
+        // a multiple of the row count, so the staging never leaves the buffer.
+        cp.dispatch_workgroups(rows.div_ceil(shaders::AUDIO_LN_ROWS) as u32, 1, 1);
     }
 }
 
