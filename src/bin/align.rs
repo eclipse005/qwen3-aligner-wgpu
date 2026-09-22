@@ -14,6 +14,7 @@ use qwen3_aligner_wgpu::align_inference::Aligner;
 use qwen3_aligner_wgpu::gpu::DeviceSelector;
 use qwen3_aligner_wgpu::paths;
 use qwen3_aligner_wgpu::postprocess::AlignItem;
+use qwen3_aligner_wgpu::shaders;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,6 +52,22 @@ fn main() -> Result<()> {
     let device = arg_value(&args, "--device").unwrap_or_else(|| "auto".to_string());
     let selector = DeviceSelector::parse(&device)?;
 
+    // The 16-bit storage format is fixed before the first pipeline exists, so it
+    // is resolved here and handed to the load rather than set afterwards; see
+    // `Aligner::load_with_dtype`.
+    let dtype =
+        arg_value(&args, "--dtype").unwrap_or_else(|| shaders::DEFAULT_HALF.name().to_string());
+    let half = shaders::Half::parse(&dtype).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dtype {dtype}: expected one of {}",
+            shaders::Half::ALL
+                .iter()
+                .map(|h| h.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
     let audio = arg_value(&args, "--audio").context("--audio <wav> is required")?;
     let audio = PathBuf::from(audio);
     anyhow::ensure!(audio.is_file(), "no such audio file: {}", audio.display());
@@ -68,10 +85,11 @@ fn main() -> Result<()> {
     let language = arg_value(&args, "--language");
 
     let t_load = Instant::now();
-    let mut aligner = Aligner::load(selector, &model_dir)?;
+    let mut aligner = Aligner::load_with_dtype(selector, &model_dir, half)?;
     eprintln!(
-        "device {}  load {:.1}s",
+        "device {}  dtype {}  load {:.1}s",
         aligner.describe(),
+        aligner.half().name(),
         t_load.elapsed().as_secs_f64()
     );
 
@@ -162,6 +180,12 @@ OPTIONS:
   --model <dir>    checkpoint directory; default `QALIGN_MODEL`, else
                    D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf.
   --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
+  --dtype <f16|bf16>
+                   storage format for the 16-bit weights and activations.  f16
+                   (default) is what reproduces the reference: it has no
+                   unmatched endpoint against any of the three golds, while
+                   rounding at bf16 -- the checkpoint's own storage -- was
+                   measured to diverge further, not closer.  See docs/perf.md.
   --raw <json>     also write the pre-repair millisecond stream (the model's own
                    argmax, before `fix_timestamps` touches it)
 ";

@@ -23,7 +23,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use half::f16;
+
+// f16 and bf16 are the same width and the same packing, so this file's host-side
+// vectors are one type either way: `f16` here is [`crate::half16::H16`], which
+// carries whichever format `--dtype` selected (bf16 by default).  The helper
+// names keep their historical spelling — what they hold is the run's format.
+use crate::half16::H16 as f16;
 
 use crate::audio_encoder::feo;
 use crate::config::AudioEncoderConfig;
@@ -239,7 +244,7 @@ impl GpuLinear {
         let w = weights::get_matrix(weights, &format!("{prefix}.weight"))?;
         let n = w.rows;
         let k = w.cols;
-        let bias = weights::get_f16(weights, &format!("{prefix}.bias"))
+        let bias = weights::get_h16(weights, &format!("{prefix}.bias"))
             .ok()
             .map(|(b, _)| b);
         let w = pad_k(&pad_rows(&w, align(n, GEMM_BM))?)?;
@@ -264,11 +269,11 @@ impl GpuLinear {
             "{name}: shape {:?} is not a 3×3 conv",
             t.shape
         );
-        let (w, shape) = t.as_f16()?;
+        let (w, shape) = t.as_h16()?;
         anyhow::ensure!(shape[0] == n && w.len() == n * k);
-        let (bias, bshape) = weights::get_f16(weights, &format!("{prefix}.bias"))?;
+        let (bias, bshape) = weights::get_h16(weights, &format!("{prefix}.bias"))?;
         anyhow::ensure!(bshape.len() == 1 && bshape[0] == n, "{prefix}.bias {bshape:?} != [{n}]");
-        let packed = pad_k(&PackedWeight::from_f16(&w, n, k))?;
+        let packed = pad_k(&PackedWeight::from_h16(&w, n, k))?;
         let packed = pad_rows(&packed, align(n, GEMM_BM))?;
         Self::finish(up, label, packed, Some(bias), n, pad_k_tile(k))
     }
@@ -284,7 +289,7 @@ impl GpuLinear {
         let mut bias: Vec<f16> = Vec::new();
         for p in parts {
             mats.push(weights::get_matrix(weights, &format!("{prefix}.{p}.weight"))?);
-            let (b, _) = weights::get_f16(weights, &format!("{prefix}.{p}.bias"))?;
+            let (b, _) = weights::get_h16(weights, &format!("{prefix}.{p}.bias"))?;
             bias.extend_from_slice(&b);
         }
         let k = mats[0].cols;
@@ -311,8 +316,8 @@ impl GpuLayerNorm {
         label: &str,
         eps: f32,
     ) -> Result<Self> {
-        let w = weights::get_vector(weights, &format!("{prefix}.weight"))?;
-        let b = weights::get_vector(weights, &format!("{prefix}.bias"))?;
+        let w = weights::get_h16_vector(weights, &format!("{prefix}.weight"))?;
+        let b = weights::get_h16_vector(weights, &format!("{prefix}.bias"))?;
         anyhow::ensure!(w.len() == b.len(), "{prefix}: weight/bias len mismatch");
         Ok(Self {
             w: upload_f16(up, &format!("{label}.w"), &w)?,
@@ -923,7 +928,8 @@ impl GpuAudioEncoder {
         }
     }
 
-    /// Encode `[n_mels, n_frames]` (mel-bin major) into `[n_tokens, out_dim]` f16.
+    /// Encode `[n_mels, n_frames]` (mel-bin major) into `[n_tokens, out_dim]`, in
+    /// the run's 16-bit storage format.
     pub fn encode(
         &mut self,
         gpu: &Gpu,
@@ -969,7 +975,7 @@ impl GpuAudioEncoder {
                 chunked[dst..dst + len].copy_from_slice(&mel[src..src + len]);
             }
         }
-        let mel_f16: Vec<f16> = chunked.iter().map(|v| f16::from_f32(*v)).collect();
+        let mel16: Vec<f16> = chunked.iter().map(|v| f16::from_f32(*v)).collect();
         let t_pack = t_pack.elapsed();
 
         // ── clip-sized buffers ──
@@ -985,8 +991,8 @@ impl GpuAudioEncoder {
         let geom = Geom { n_chunks, s: n_total, wlen, n_win, s_win: n_win * wlen };
         let words = |n: usize| (n / 2 * 4) as u64;
 
-        let mel_buf = gpu.storage("enc.mel", (mel_f16.len() * 2) as u64);
-        gpu.upload(&mel_buf, &weights::words_bytes(&mel_f16));
+        let mel_buf = gpu.storage("enc.mel", (mel16.len() * 2) as u64);
+        gpu.upload(&mel_buf, &weights::words_bytes(&mel16));
         let packed = gpu.storage("enc.packed", words(s_pad * cf));
         let h_raw = gpu.storage("enc.h_raw", words(s_pad * dm));
         let h_buf = gpu.storage("enc.h", words(s_pad * dm));
@@ -1941,7 +1947,7 @@ fn gemm_bias_layout(gpu: &Gpu, label: &str, read_write: &[u32]) -> wgpu::Pipelin
     })
 }
 
-/// Read `n` packed f16 elements back as a vector.
+/// Read `n` packed 16-bit elements back as a vector in the run's format.
 fn read_f16_buf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize) -> Result<Vec<f16>> {
     let bytes = gpu.readback(buf, (n * 2) as u64)?;
     Ok(bytes
@@ -1972,8 +1978,8 @@ fn mel_elems(n_mels: usize, w0: usize) -> usize {
     n_mels * w0
 }
 
-/// Zero-pad a `[rows, cols]` f16 matrix's columns to the next even count: the
-/// GEMM reads packed f16 pairs along k, so an odd k shears every row by half a
+/// Zero-pad a `[rows, cols]` matrix's columns to the next even count: the GEMM
+/// reads packed 16-bit pairs along k, so an odd k shears every row by half a
 /// word.
 fn pad_k(w: &PackedWeight) -> Result<PackedWeight> {
     let kw = pad_k_tile(w.cols);

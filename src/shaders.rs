@@ -1,19 +1,332 @@
 //! WGSL sources for the decode chain.  f32 addition is not associative, so the
 //! reduction orders below are load-bearing.
 //!
-//! Layout: activations are f16 packed as `array<u32>` (word `j` holds elements
-//! `2j` / `2j+1`); weights are f16 packed as `array<vec4<u32>>` (8 halves = 16 B
-//! per element).  A plain `array<f16>` binding is never needed — Pascal exposes
-//! 16-bit storage but not `shaderFloat16`.
+//! Layout: activations are 16-bit floats packed as `array<u32>` (word `j` holds
+//! elements `2j` / `2j+1`); weights are packed as `array<vec4<u32>>` (8 halves =
+//! 16 B per element).  A plain `array<f16>` binding is never needed — Pascal
+//! exposes 16-bit storage but not `shaderFloat16`.
+//!
+//! ## Why the storage format is a parameter
+//!
+//! The published checkpoint stores **bf16** and the reference runs it that way
+//! (`AutoModelForTokenClassification.from_pretrained(..., dtype=torch.bfloat16)`),
+//! so matching the reference means rounding the activations to bf16 at the same
+//! boundaries.  f16 and bf16 are the same width and the same packing, so the
+//! choice costs nothing in layout — it changes only how a packed word is
+//! unpacked and how a result is packed, which is what [`Half`] supplies.
+//!
+//! Storing f16 instead (10 mantissa bits rather than bf16's 8) computes *more*
+//! precisely, and lands on the fp32 reference instead — see `docs/perf.md` §1.1b.
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 pub const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
-/// Read element `i` out of a packed f16 word (`v.x` = even index, `v.y` = odd).
+/// The 16-bit storage format, as a shader prelude.
+///
+/// Both variants present the same interface to a kernel: `unpack_h(w) ->
+/// vec2<f32>` (element 0 = `.x`, element 1 = `.y`) and `pack_h(v) -> u32`.
+/// Swapping the format is therefore a rebuild of the shader source and nothing
+/// else: same buffer sizes, same strides, same bindings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Half {
+    /// IEEE binary16.  What this implementation shipped with; more precise than
+    /// the reference for the same footprint.
+    F16,
+    /// bfloat16 — the top 16 bits of an f32.  What the reference computes in.
+    Bf16,
+}
+
+impl Half {
+    pub const ALL: [Half; 2] = [Half::F16, Half::Bf16];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Half::F16 => "f16",
+            Half::Bf16 => "bf16",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Half> {
+        match s.to_ascii_lowercase().as_str() {
+            "f16" | "fp16" | "half" => Some(Half::F16),
+            "bf16" | "bfloat16" => Some(Half::Bf16),
+            _ => None,
+        }
+    }
+
+    /// The prelude a kernel needs in order to move values in and out of storage.
+    pub fn prelude(self) -> &'static str {
+        match self {
+            Half::F16 => "\
+fn unpack_h(w: u32) -> vec2<f32> { return unpack2x16float(w); }
+fn pack_h(v: vec2<f32>) -> u32 { return pack2x16float(v); }
+",
+            Half::Bf16 => "\
+fn unpack_h(w: u32) -> vec2<f32> {
+    // bf16 is the top half of an f32, so each element is a bitcast with the
+    // other half filled in: the low element shifts up, the high element is
+    // already in place (its low bits are zero, which is a valid f32).
+    return vec2<f32>(bitcast<f32>(w << 16u), bitcast<f32>(w & 0xFFFF0000u));
+}
+fn rne_bf16(x: f32) -> u32 {
+    // Round to nearest, ties to even, at bit 16 — `x + 0x7FFF + lsb` carries
+    // into the exponent exactly when the discarded bits are past the halfway
+    // point, or exactly at it with an odd keeper.  Finite operands only; the
+    // rne_bf16_matches_half_crate test states where this stops holding.
+    let u = bitcast<u32>(x);
+    return u + 0x7FFFu + ((u >> 16u) & 1u);
+}
+fn pack_h(v: vec2<f32>) -> u32 {
+    return (rne_bf16(v.x) >> 16u) | (rne_bf16(v.y) & 0xFFFF0000u);
+}
+",
+        }
+    }
+
+    /// The byte the process-wide setting stores — the discriminant, so the
+    /// `u8` and the enum cannot drift apart.
+    fn from_byte(b: u8) -> Half {
+        Half::ALL
+            .into_iter()
+            .find(|h| *h as u8 == b)
+            .unwrap_or(DEFAULT_HALF)
+    }
+}
+
+/// The run's storage format, resolved once.
+///
+/// The format follows from the checkpoint plus the caller's `--dtype`, so it is
+/// a constant for the whole process: every kernel's prelude, every weight the
+/// uploader narrows and every host-side conversion reads this one value.  It
+/// must be fixed **before the first pipeline is built** — a pipeline compiled
+/// for the other format keeps unpacking the other format while the weights come
+/// from this one, and nothing about that is visible in the output except the
+/// timestamps being wrong.
+///
+/// [`set_half`] therefore panics on a second, *different* value, and treats a
+/// repeat of the same value as a no-op: the CLI and a library caller both
+/// naming bf16 is not a conflict.
+static HALF: AtomicU8 = AtomicU8::new(UNSET);
+
+/// No format chosen yet.  Not a `Half` discriminant, so "unset" cannot be
+/// mistaken for a choice.
+const UNSET: u8 = u8::MAX;
+
+/// The format a run gets unless it asks for another one: **f16**.
+///
+/// Not bf16, even though the checkpoint stores bf16 and the reference computes in
+/// it.  Coarsening the activations to match was implemented and measured against
+/// every gold, and it made the port a *worse* reproduction of the reference, not
+/// a better one: against the bf16 gold, the f16 engine has **0** hard-failing
+/// endpoints on both streams (3597/3622 raw, 3590/3622 repaired — the remainder
+/// being endpoints the reference itself answers differently per dtype, with our
+/// value equal to the fp32 run's at every one of them), while the bf16 engine has
+/// 10 and 15.
+///
+/// The reason is that the reference's dtype governs its whole arithmetic — the
+/// accumulation order and every place torch rounds — and this port fuses
+/// differently on purpose, because that is where its speed comes from.  f16's
+/// finer grid keeps those structural differences below the granularity that can
+/// flip an argmax; bf16's coarser grid promotes them into visible flips.  See
+/// `docs/perf.md` §1.1c for the cross-table.
+///
+/// `--dtype bf16` stays available to anyone who wants to see that directly.
+pub const DEFAULT_HALF: Half = Half::F16;
+
+/// Fix the 16-bit storage format for this process — before the first pipeline
+/// exists, see [`HALF`].
+pub fn set_half(h: Half) {
+    match HALF.compare_exchange(UNSET, h as u8, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => {}
+        Err(cur) if cur == h as u8 => {}
+        Err(cur) => panic!(
+            "shaders::set_half({}) after the format was already fixed to {}: the pipelines \
+             built for the first format would go on unpacking it",
+            h.name(),
+            Half::from_byte(cur).name()
+        ),
+    }
+}
+
+/// The process-wide storage format — what [`set_half`] fixed, or
+/// [`DEFAULT_HALF`] if nobody did.
+pub fn half() -> Half {
+    Half::from_byte(HALF.load(Ordering::Relaxed))
+}
+
+/// Read element `i` out of a packed 16-bit word (`v.x` = even index, `v.y` = odd).
+///
+/// Format-independent — it picks out of a pair `unpack_h` already widened — so it
+/// is one string rather than a [`Half`] method.  Injected by the builders that
+/// need it; the audio tower's shaders spell their own equivalent inline.
 const HALF_AT: &str = "\
 fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.y, v.x, (i & 1u) == 0u); }
 ";
+
+/// [`Half`]'s bf16 rounding, in Rust — the high 16 bits of the WGSL `rne_bf16`.
+///
+/// The shader cannot be executed from a unit test on this box, so the test below
+/// pins *this* transcription against the `half` crate's `bf16::from_f32`, which
+/// rounds the same way the reference's casts do.  A transcription can drift from
+/// the WGSL it mirrors, and that risk is smaller than shipping a rounding rule
+/// nothing checks (see `OPTIMIZATION_PLAYBOOK` §4.4).
+pub fn rne_bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    (u.wrapping_add(0x7FFF + ((u >> 16) & 1)) >> 16) as u16
+}
+
+#[cfg(test)]
+mod bf16_round_tests {
+    use super::*;
+
+    /// The bf16 path's rounding has to be the reference's rule, or every layer
+    /// it touches is off in a direction nobody chose.
+    ///
+    /// `half::bf16::from_f32` is round-to-nearest-even, the same rule as
+    /// `torch.Tensor.to(torch.bfloat16)` and the cast cuBLAS applies to a bf16
+    /// GEMM's f32 accumulator, so agreeing with it is the whole test.
+    #[test]
+    fn rne_bf16_matches_half_crate() {
+        let mut checked = 0usize;
+        let mut bad: Vec<(f32, u16, u16)> = Vec::new();
+
+        let check = |x: f32, checked: &mut usize, bad: &mut Vec<(f32, u16, u16)>| {
+            // NaN is excluded on purpose: this rule propagates the payload bits
+            // instead of coercing to a quiet NaN like `half` does.  Nothing in
+            // the model feeds NaN into a cast, and `nan_is_the_only_gap` states
+            // the gap rather than hiding it.
+            if !x.is_finite() {
+                return;
+            }
+            *checked += 1;
+            let ours = rne_bf16_bits(x);
+            let want = half::bf16::from_f32(x).to_bits();
+            if ours != want && bad.len() < 8 {
+                bad.push((x, ours, want));
+            }
+        };
+
+        // Halfway cases: the low 16 bits at exactly 0x8000 are ties, and
+        // 0x7FFF / 0x8001 sit either side of one.  Cancellation inside a GEMM's
+        // accumulator lands on exactly these far more often than chance, which
+        // is why they get their own sweep rather than trusting a random one.
+        for &e in &[0u32, 1, 2, 50, 63, 64, 100, 126, 127, 128, 200, 250, 253, 254] {
+            for &m_top in &[0u32, 1, 2, 0x3F, 0x40, 0x7E, 0x7F] {
+                for &low in &[0u32, 1, 0x7FFE, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF] {
+                    for &sign in &[0u32, 1u32 << 31] {
+                        check(
+                            f32::from_bits(sign | (e << 23) | (m_top << 16) | low),
+                            &mut checked,
+                            &mut bad,
+                        );
+                    }
+                }
+            }
+        }
+
+        // And a dense pseudo-random sweep over the whole bit space, so the
+        // exponent ranges the table above never reaches are still covered.
+        let mut s = 0x1234_5678u32;
+        for _ in 0..500_000 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            check(f32::from_bits(s), &mut checked, &mut bad);
+        }
+
+        assert!(
+            bad.is_empty(),
+            "{checked} values checked; first mismatches (x, ours, half) = {bad:?}"
+        );
+        assert!(checked > 400_000, "sweep did not run: {checked} checked");
+    }
+
+    /// The one input class this rule does not reproduce, stated explicitly: a
+    /// NaN keeps its payload here and becomes a quiet NaN in `half`.
+    #[test]
+    fn nan_is_the_only_gap() {
+        let qnan = f32::from_bits(0x7FC0_0001);
+        assert!(qnan.is_nan());
+        assert!(half::bf16::from_f32(qnan).is_nan());
+        // Ours is also a NaN -- it just may not be the same NaN.
+        assert!(f32::from_bits((rne_bf16_bits(qnan) as u32) << 16).is_nan());
+    }
+
+    /// The setting starts unset and reads back as the checkpoint's own format,
+    /// so a caller that names none still gets the reference's arithmetic.
+    ///
+    /// The conflict path is deliberately not exercised here: the setting is
+    /// process-wide, and a test that trips the panic takes every other test in
+    /// this binary with it.
+    /// The default is f16, and that is a measured choice rather than a
+    /// preference: it is the format with no unmatched endpoint against any of the
+    /// three golds.  A test that pinned bf16 here would have been pinning the
+    /// worse of the two, so what this asserts is the *reason* as much as the
+    /// value -- see [`DEFAULT_HALF`].
+    #[test]
+    fn the_format_defaults_to_f16() {
+        assert_eq!(DEFAULT_HALF, Half::F16);
+        assert_eq!(half(), DEFAULT_HALF);
+        assert_eq!(Half::from_byte(u8::MAX), DEFAULT_HALF);
+        for h in Half::ALL {
+            assert_eq!(Half::from_byte(h as u8), h, "{}", h.name());
+        }
+        // Naming the running format again is not a conflict.
+        set_half(half());
+        set_half(DEFAULT_HALF);
+        assert_eq!(half(), DEFAULT_HALF);
+    }
+
+    /// f16 and bf16 must present the same interface *and* the same element
+    /// order: word `j` holds element `2j` in its low half and `2j+1` in its high
+    /// half.  Every kernel's indexing assumes that, and a swapped `.x`/`.y` in
+    /// the bf16 arm is precisely what it would break.
+    ///
+    /// The order is pinned by the expressions that spell it out rather than by
+    /// containment, because a containment check passes just as happily on the
+    /// swapped version.  That makes this test sensitive to reformatting the
+    /// shader — which is the right way round for the one convention that has no
+    /// other check behind it.
+    #[test]
+    fn both_formats_agree_on_the_packing() {
+        for h in Half::ALL {
+            assert!(h.prelude().contains("fn unpack_h("), "{} unpack", h.name());
+            assert!(h.prelude().contains("fn pack_h("), "{} pack", h.name());
+        }
+
+        let bf = Half::Bf16.prelude();
+        // Unpack: element 0 from the low half, element 1 from the high half.
+        assert!(
+            bf.contains("bitcast<f32>(w << 16u)"),
+            "bf16 element 0 must be taken from the low half"
+        );
+        assert!(
+            bf.contains("bitcast<f32>(w & 0xFFFF0000u)"),
+            "bf16 element 1 must be taken from the high half"
+        );
+        // Pack, the same convention in reverse.
+        assert!(
+            bf.contains("rne_bf16(v.x) >> 16u"),
+            "bf16 pack must place element 0 in the low half"
+        );
+        assert!(
+            bf.contains("rne_bf16(v.y) & 0xFFFF0000u"),
+            "bf16 pack must place element 1 in the high half"
+        );
+
+        // f16 delegates to the builtins, which pack the same way; that the two
+        // agree is the whole point of the switch.
+        let f = Half::F16.prelude();
+        assert!(f.contains("unpack2x16float(w)"));
+        assert!(f.contains("pack2x16float(v)"));
+
+        assert_eq!(Half::parse("bf16"), Some(Half::Bf16));
+        assert_eq!(Half::parse("BFloat16"), Some(Half::Bf16));
+        assert_eq!(Half::parse("f16"), Some(Half::F16));
+        assert_eq!(Half::parse("fp32"), None);
+    }
+}
 
 /// `rms_norm_f16` — one workgroup per row, block tree reduction over `LAST`.
 ///
@@ -45,7 +358,7 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
     let row = wgid.x * LAST2;
     var local = 0.0;
     for (var j = lid.x; j < LAST2; j = j + BS) {{
-        let v = unpack2x16float(X[row + j]);
+        let v = unpack_h(X[row + j]);
         local = local + (v.x * v.x + v.y * v.y);
     }}
     red[lid.x] = local;
@@ -57,9 +370,9 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
     let inv_rms = inverseSqrt(red[0] / f32(LAST) + cfg.eps);
     workgroupBarrier();
     for (var j = lid.x; j < LAST2; j = j + BS) {{
-        let xv = unpack2x16float(X[row + j]);
-        let wv = unpack2x16float(Wt[j]);
-        Out[row + j] = pack2x16float(vec2<f32>(
+        let xv = unpack_h(X[row + j]);
+        let wv = unpack_h(Wt[j]);
+        Out[row + j] = pack_h(vec2<f32>(
             xv.x * inv_rms * wv.x,
             xv.y * inv_rms * wv.y));
     }}
@@ -127,8 +440,8 @@ var<workgroup> bt1: array<f32, 256>;
         for c in 0..4 {
             let sel = ["x", "y", "z", "w"][c];
             body.push_str(&format!(
-                "        let w{g}{c} = unpack2x16float(wv{g}.{sel});\n\
-                 \x20        let x{g}{c} = unpack2x16float(xv{g}.{sel});\n\
+                "        let w{g}{c} = unpack_h(wv{g}.{sel});\n\
+                 \x20        let x{g}{c} = unpack_h(xv{g}.{sel});\n\
                  \x20        a{c} = fma(w{g}{c}.x, x{g}{c}.x, fma(w{g}{c}.y, x{g}{c}.y, a{c}));\n",
             ));
         }
@@ -195,11 +508,11 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
         vb = vb + P[(2u * i + 1u) * cfg.splits + s];
     }}
     if (ACCUM == 1u) {{
-        let old = unpack2x16float(Y[i]);
+        let old = unpack_h(Y[i]);
         va = va + old.x;
         vb = vb + old.y;
     }}
-    Y[i] = pack2x16float(vec2<f32>(va, vb));
+    Y[i] = pack_h(vec2<f32>(va, vb));
 }}
 ",
         accum = u32::from(accum),
@@ -303,34 +616,34 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         let xv2 = X[i + 64u];
         let wv3 = Wt[wbase + i + 96u];
         let xv3 = X[i + 96u];
-        let w00 = unpack2x16float(wv0.x); let x00 = unpack2x16float(xv0.x);
-        let w01 = unpack2x16float(wv0.y); let x01 = unpack2x16float(xv0.y);
-        let w02 = unpack2x16float(wv0.z); let x02 = unpack2x16float(xv0.z);
-        let w03 = unpack2x16float(wv0.w); let x03 = unpack2x16float(xv0.w);
+        let w00 = unpack_h(wv0.x); let x00 = unpack_h(xv0.x);
+        let w01 = unpack_h(wv0.y); let x01 = unpack_h(xv0.y);
+        let w02 = unpack_h(wv0.z); let x02 = unpack_h(xv0.z);
+        let w03 = unpack_h(wv0.w); let x03 = unpack_h(xv0.w);
         a0 = fma(w00.x, x00.x, fma(w00.y, x00.y, a0));
         a1 = fma(w01.x, x01.x, fma(w01.y, x01.y, a1));
         a2 = fma(w02.x, x02.x, fma(w02.y, x02.y, a2));
         a3 = fma(w03.x, x03.x, fma(w03.y, x03.y, a3));
-        let w10 = unpack2x16float(wv1.x); let x10 = unpack2x16float(xv1.x);
-        let w11 = unpack2x16float(wv1.y); let x11 = unpack2x16float(xv1.y);
-        let w12 = unpack2x16float(wv1.z); let x12 = unpack2x16float(xv1.z);
-        let w13 = unpack2x16float(wv1.w); let x13 = unpack2x16float(xv1.w);
+        let w10 = unpack_h(wv1.x); let x10 = unpack_h(xv1.x);
+        let w11 = unpack_h(wv1.y); let x11 = unpack_h(xv1.y);
+        let w12 = unpack_h(wv1.z); let x12 = unpack_h(xv1.z);
+        let w13 = unpack_h(wv1.w); let x13 = unpack_h(xv1.w);
         a0 = fma(w10.x, x10.x, fma(w10.y, x10.y, a0));
         a1 = fma(w11.x, x11.x, fma(w11.y, x11.y, a1));
         a2 = fma(w12.x, x12.x, fma(w12.y, x12.y, a2));
         a3 = fma(w13.x, x13.x, fma(w13.y, x13.y, a3));
-        let w20 = unpack2x16float(wv2.x); let x20 = unpack2x16float(xv2.x);
-        let w21 = unpack2x16float(wv2.y); let x21 = unpack2x16float(xv2.y);
-        let w22 = unpack2x16float(wv2.z); let x22 = unpack2x16float(xv2.z);
-        let w23 = unpack2x16float(wv2.w); let x23 = unpack2x16float(xv2.w);
+        let w20 = unpack_h(wv2.x); let x20 = unpack_h(xv2.x);
+        let w21 = unpack_h(wv2.y); let x21 = unpack_h(xv2.y);
+        let w22 = unpack_h(wv2.z); let x22 = unpack_h(xv2.z);
+        let w23 = unpack_h(wv2.w); let x23 = unpack_h(xv2.w);
         a0 = fma(w20.x, x20.x, fma(w20.y, x20.y, a0));
         a1 = fma(w21.x, x21.x, fma(w21.y, x21.y, a1));
         a2 = fma(w22.x, x22.x, fma(w22.y, x22.y, a2));
         a3 = fma(w23.x, x23.x, fma(w23.y, x23.y, a3));
-        let w30 = unpack2x16float(wv3.x); let x30 = unpack2x16float(xv3.x);
-        let w31 = unpack2x16float(wv3.y); let x31 = unpack2x16float(xv3.y);
-        let w32 = unpack2x16float(wv3.z); let x32 = unpack2x16float(xv3.z);
-        let w33 = unpack2x16float(wv3.w); let x33 = unpack2x16float(xv3.w);
+        let w30 = unpack_h(wv3.x); let x30 = unpack_h(xv3.x);
+        let w31 = unpack_h(wv3.y); let x31 = unpack_h(xv3.y);
+        let w32 = unpack_h(wv3.z); let x32 = unpack_h(xv3.z);
+        let w33 = unpack_h(wv3.w); let x33 = unpack_h(xv3.w);
         a0 = fma(w30.x, x30.x, fma(w30.y, x30.y, a0));
         a1 = fma(w31.x, x31.x, fma(w31.y, x31.y, a1));
         a2 = fma(w32.x, x32.x, fma(w32.y, x32.y, a2));
@@ -347,11 +660,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
             var va = rows_out[2u * w];
             var vb = rows_out[2u * w + 1u];
             if (ACCUM == 1u) {{
-                let old = unpack2x16float(Y[wordbase + w]);
+                let old = unpack_h(Y[wordbase + w]);
                 va = va + old.x;
                 vb = vb + old.y;
             }}
-            Y[wordbase + w] = pack2x16float(vec2<f32>(va, vb));
+            Y[wordbase + w] = pack_h(vec2<f32>(va, vb));
         }}
     }}
 }}
@@ -371,7 +684,7 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 /// `bs = block_for_reduction(hs)` and the workgroup is 256, so each thread folds
 /// `vc = bs/256` virtual partials with the same pairing and add order as the
 /// norm's `red[t] += red[t+s]` tree.  The staging loop writes the f16
-/// `pack2x16float(x * inv_rms * w)` the norm would have stored, not an f32
+/// `pack_h(x * inv_rms * w)` the norm would have stored, not an f32
 /// intermediate.  Writes `Y` exactly like [`gemv`].
 pub fn gemv_norm(
     n: usize,
@@ -416,7 +729,7 @@ pub fn gemv_norm(
         let off = i * 256;
         sums.push_str(&format!(
             "    for (var j = lid.x + {off}u; j < LAST2; j = j + BS) {{\n\
-             \x20       let v = unpack2x16float(Xr[j]);\n\
+             \x20       let v = unpack_h(Xr[j]);\n\
              \x20       l{i} = l{i} + (v.x * v.x + v.y * v.y);\n\
              \x20   }}\n"
         ));
@@ -482,9 +795,9 @@ fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
 /// Normalized output word `j`: the same two multiplies in the same order the
 /// norm applies, so the f16 rounding matches.
 fn norm_word(j: u32, inv_rms: f32) -> u32 {{
-    let xv = unpack2x16float(Xr[j]);
-    let wv = unpack2x16float(NW[j]);
-    return pack2x16float(vec2<f32>(xv.x * inv_rms * wv.x, xv.y * inv_rms * wv.y));
+    let xv = unpack_h(Xr[j]);
+    let wv = unpack_h(NW[j]);
+    return pack_h(vec2<f32>(xv.x * inv_rms * wv.x, xv.y * inv_rms * wv.y));
 }}
 
 @compute @workgroup_size(256)
@@ -525,34 +838,34 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         let xv2 = xs[i + 64u];
         let wv3 = Wt[wbase + i + 96u];
         let xv3 = xs[i + 96u];
-        let w00 = unpack2x16float(wv0.x); let x00 = unpack2x16float(xv0.x);
-        let w01 = unpack2x16float(wv0.y); let x01 = unpack2x16float(xv0.y);
-        let w02 = unpack2x16float(wv0.z); let x02 = unpack2x16float(xv0.z);
-        let w03 = unpack2x16float(wv0.w); let x03 = unpack2x16float(xv0.w);
+        let w00 = unpack_h(wv0.x); let x00 = unpack_h(xv0.x);
+        let w01 = unpack_h(wv0.y); let x01 = unpack_h(xv0.y);
+        let w02 = unpack_h(wv0.z); let x02 = unpack_h(xv0.z);
+        let w03 = unpack_h(wv0.w); let x03 = unpack_h(xv0.w);
         a0 = fma(w00.x, x00.x, fma(w00.y, x00.y, a0));
         a1 = fma(w01.x, x01.x, fma(w01.y, x01.y, a1));
         a2 = fma(w02.x, x02.x, fma(w02.y, x02.y, a2));
         a3 = fma(w03.x, x03.x, fma(w03.y, x03.y, a3));
-        let w10 = unpack2x16float(wv1.x); let x10 = unpack2x16float(xv1.x);
-        let w11 = unpack2x16float(wv1.y); let x11 = unpack2x16float(xv1.y);
-        let w12 = unpack2x16float(wv1.z); let x12 = unpack2x16float(xv1.z);
-        let w13 = unpack2x16float(wv1.w); let x13 = unpack2x16float(xv1.w);
+        let w10 = unpack_h(wv1.x); let x10 = unpack_h(xv1.x);
+        let w11 = unpack_h(wv1.y); let x11 = unpack_h(xv1.y);
+        let w12 = unpack_h(wv1.z); let x12 = unpack_h(xv1.z);
+        let w13 = unpack_h(wv1.w); let x13 = unpack_h(xv1.w);
         a0 = fma(w10.x, x10.x, fma(w10.y, x10.y, a0));
         a1 = fma(w11.x, x11.x, fma(w11.y, x11.y, a1));
         a2 = fma(w12.x, x12.x, fma(w12.y, x12.y, a2));
         a3 = fma(w13.x, x13.x, fma(w13.y, x13.y, a3));
-        let w20 = unpack2x16float(wv2.x); let x20 = unpack2x16float(xv2.x);
-        let w21 = unpack2x16float(wv2.y); let x21 = unpack2x16float(xv2.y);
-        let w22 = unpack2x16float(wv2.z); let x22 = unpack2x16float(xv2.z);
-        let w23 = unpack2x16float(wv2.w); let x23 = unpack2x16float(xv2.w);
+        let w20 = unpack_h(wv2.x); let x20 = unpack_h(xv2.x);
+        let w21 = unpack_h(wv2.y); let x21 = unpack_h(xv2.y);
+        let w22 = unpack_h(wv2.z); let x22 = unpack_h(xv2.z);
+        let w23 = unpack_h(wv2.w); let x23 = unpack_h(xv2.w);
         a0 = fma(w20.x, x20.x, fma(w20.y, x20.y, a0));
         a1 = fma(w21.x, x21.x, fma(w21.y, x21.y, a1));
         a2 = fma(w22.x, x22.x, fma(w22.y, x22.y, a2));
         a3 = fma(w23.x, x23.x, fma(w23.y, x23.y, a3));
-        let w30 = unpack2x16float(wv3.x); let x30 = unpack2x16float(xv3.x);
-        let w31 = unpack2x16float(wv3.y); let x31 = unpack2x16float(xv3.y);
-        let w32 = unpack2x16float(wv3.z); let x32 = unpack2x16float(xv3.z);
-        let w33 = unpack2x16float(wv3.w); let x33 = unpack2x16float(xv3.w);
+        let w30 = unpack_h(wv3.x); let x30 = unpack_h(xv3.x);
+        let w31 = unpack_h(wv3.y); let x31 = unpack_h(xv3.y);
+        let w32 = unpack_h(wv3.z); let x32 = unpack_h(xv3.z);
+        let w33 = unpack_h(wv3.w); let x33 = unpack_h(xv3.w);
         a0 = fma(w30.x, x30.x, fma(w30.y, x30.y, a0));
         a1 = fma(w31.x, x31.x, fma(w31.y, x31.y, a1));
         a2 = fma(w32.x, x32.x, fma(w32.y, x32.y, a2));
@@ -569,11 +882,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
             var va = rows_out[2u * w];
             var vb = rows_out[2u * w + 1u];
             if (ACCUM == 1u) {{
-                let old = unpack2x16float(Y[wordbase + w]);
+                let old = unpack_h(Y[wordbase + w]);
                 va = va + old.x;
                 vb = vb + old.y;
             }}
-            Y[wordbase + w] = pack2x16float(vec2<f32>(va, vb));
+            Y[wordbase + w] = pack_h(vec2<f32>(va, vb));
         }}
     }}
 }}
@@ -632,7 +945,7 @@ var<workgroup> red: array<f32, 128>;
 fn head_inv_rms(base: u32, lid: u32) -> f32 {{
     var local = 0.0;
     for (var j = lid; j < D; j = j + BS) {{
-        let e = half_at(unpack2x16float(Qkv[base + (j >> 1u)]), j);
+        let e = half_at(unpack_h(Qkv[base + (j >> 1u)]), j);
         local = local + e * e;
     }}
     red[lid] = local;
@@ -649,26 +962,26 @@ fn head_inv_rms(base: u32, lid: u32) -> f32 {{
 /// One roped output element: norm over the head row, then rotate-half RoPE.
 /// `use_q` picks the Q norm weights over the K norm weights.
 fn rope_elem(use_q: bool, base: u32, csbase: u32, j: u32, inv_rms: f32) -> f32 {{
-    let xj = half_at(unpack2x16float(Qkv[base + (j >> 1u)]), j);
+    let xj = half_at(unpack_h(Qkv[base + (j >> 1u)]), j);
     var wj = 0.0;
     if (use_q) {{
-        wj = half_at(unpack2x16float(QnW[j >> 1u]), j);
+        wj = half_at(unpack_h(QnW[j >> 1u]), j);
     }} else {{
-        wj = half_at(unpack2x16float(KnW[j >> 1u]), j);
+        wj = half_at(unpack_h(KnW[j >> 1u]), j);
     }}
     let x_val_j = xj * inv_rms * wj;
     let pj = select(j - HD, j + HD, j < HD);
-    let xp = half_at(unpack2x16float(Qkv[base + (pj >> 1u)]), pj);
+    let xp = half_at(unpack_h(Qkv[base + (pj >> 1u)]), pj);
     var wp = 0.0;
     if (use_q) {{
-        wp = half_at(unpack2x16float(QnW[pj >> 1u]), pj);
+        wp = half_at(unpack_h(QnW[pj >> 1u]), pj);
     }} else {{
-        wp = half_at(unpack2x16float(KnW[pj >> 1u]), pj);
+        wp = half_at(unpack_h(KnW[pj >> 1u]), pj);
     }}
     let x_pair = xp * inv_rms * wp;
     let pair_val = select(x_pair, -x_pair, j < HD);
-    let c = half_at(unpack2x16float(Cos[csbase + (j >> 1u)]), j);
-    let si = half_at(unpack2x16float(Sin[csbase + (j >> 1u)]), j);
+    let c = half_at(unpack_h(Cos[csbase + (j >> 1u)]), j);
+    let si = half_at(unpack_h(Sin[csbase + (j >> 1u)]), j);
     return x_val_j * c + pair_val * si;
 }}
 
@@ -687,7 +1000,7 @@ fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
         let inv_rms = head_inv_rms(base, lid.x);
         for (var w = lid.x; w < D2; w = w + BS) {{
             let j0 = w * 2u;
-            QOut[(hy * cfg.s + is) * D2 + w] = pack2x16float(vec2<f32>(
+            QOut[(hy * cfg.s + is) * D2 + w] = pack_h(vec2<f32>(
                 rope_elem(true, base, csbase, j0, inv_rms),
                 rope_elem(true, base, csbase, j0 + 1u, inv_rms)));
         }}
@@ -700,7 +1013,7 @@ fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
             let inv_rms = head_inv_rms(kbase, lid.x);
             for (var w = lid.x; w < D2; w = w + BS) {{
                 let j0 = w * 2u;
-                KCache[cache + w] = pack2x16float(vec2<f32>(
+                KCache[cache + w] = pack_h(vec2<f32>(
                     rope_elem(false, kbase, csbase, j0, inv_rms),
                     rope_elem(false, kbase, csbase, j0 + 1u, inv_rms)));
                 VCache[cache + w] = Qkv[vbase + w];
@@ -1009,17 +1322,17 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
         for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
             let qv = Q4[q4 + j4];
             let kv = KC4[row4 + j4];
-            let q0 = unpack2x16float(qv.x);
-            let k0 = unpack2x16float(kv.x);
+            let q0 = unpack_h(qv.x);
+            let k0 = unpack_h(kv.x);
             dot = dot + (q0.x * k0.x + q0.y * k0.y);
-            let q1 = unpack2x16float(qv.y);
-            let k1 = unpack2x16float(kv.y);
+            let q1 = unpack_h(qv.y);
+            let k1 = unpack_h(kv.y);
             dot = dot + (q1.x * k1.x + q1.y * k1.y);
-            let q2 = unpack2x16float(qv.z);
-            let k2 = unpack2x16float(kv.z);
+            let q2 = unpack_h(qv.z);
+            let k2 = unpack_h(kv.z);
             dot = dot + (q2.x * k2.x + q2.y * k2.y);
-            let q3 = unpack2x16float(qv.w);
-            let k3 = unpack2x16float(kv.w);
+            let q3 = unpack_h(qv.w);
+            let k3 = unpack_h(kv.w);
             dot = dot + (q3.x * k3.x + q3.y * k3.y);
         }}
         sc[t] = dot * cfg.scale;
@@ -1067,7 +1380,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
         var a1 = 0.0;
         for (var t = t_idx; t < cfg.cur_len; t = t + TCH) {{
             let row = kbase + t * D2;
-            let v = unpack2x16float(VC[row + jp]);
+            let v = unpack_h(VC[row + jp]);
             a0 = a0 + sc[t] * v.x;
             a1 = a1 + sc[t] * v.y;
         }}
@@ -1085,7 +1398,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
             a0 = a0 + partial[ti * D + lid.x * 2u];
             a1 = a1 + partial[ti * D + lid.x * 2u + 1u];
         }}
-        Out[qbase + lid.x] = pack2x16float(vec2<f32>(a0 * inv_sum, a1 * inv_sum));
+        Out[qbase + lid.x] = pack_h(vec2<f32>(a0 * inv_sum, a1 * inv_sum));
     }}
 }}
 ",
@@ -1125,15 +1438,48 @@ fn silu_mul_split(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let row = i / cfg.inter2;
     let c = i - row * cfg.inter2;
     let base = row * cfg.inter2 * 2u;
-    let gv = unpack2x16float(Gu[base + c]);
-    let uv = unpack2x16float(Gu[base + cfg.inter2 + c]);
+    let gv = unpack_h(Gu[base + c]);
+    let uv = unpack_h(Gu[base + cfg.inter2 + c]);
     let sx = 1.0 / (1.0 + exp2(-gv.x * LOG2E));
     let sy = 1.0 / (1.0 + exp2(-gv.y * LOG2E));
-    Out[i] = pack2x16float(vec2<f32>(gv.x * sx * uv.x, gv.y * sy * uv.y));
+    Out[i] = pack_h(vec2<f32>(gv.x * sx * uv.x, gv.y * sy * uv.y));
 }}
 ",
         log2e = format_f32(LOG2_E),
     )
+}
+
+/// Widen a run of the 16-bit storage buffer into an f32 buffer — the
+/// measurement-only companion of `QALIGN_DUMP_LAYERS` (see
+/// [`crate::decoder::WgpuTextDecoder::prefill`]).
+///
+/// Values, not bits: the copy goes through `unpack_h`, which is the one place
+/// the storage format is read, so an f16 run and a bf16 run produce the same
+/// kind of quantity and can be compared like for like.  Two grid axes for the
+/// same reason `silu_mul_split` has them — a long prefill's word count overflows
+/// one dimension's 65535 cap.
+pub fn widen_h16_f32() -> String {
+    "\
+@group(0) @binding(0) var<storage, read>       Src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> Dst: array<f32>;
+@group(0) @binding(2) var<uniform>             cfg: Cfg;
+
+struct Cfg { words: u32, src0: u32, dst0: u32, gx: u32 };
+
+const THREADS: u32 = 256u;
+
+@compute @workgroup_size(256)
+fn widen(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * (cfg.gx * THREADS);
+    if (i >= cfg.words) { return; }
+    let v = unpack_h(Src[cfg.src0 + i]);
+    // element 2j is the low half of word j and 2j+1 the high half -- the packing
+    // `pack_h` writes and `H16::to_f32` reads back
+    Dst[cfg.dst0 + 2u * i] = v.x;
+    Dst[cfg.dst0 + 2u * i + 1u] = v.y;
+}
+"
+        .to_string()
 }
 
 /// Long-context (cur_len > 1024) split-K attention, phase 1: one workgroup per
@@ -1205,17 +1551,17 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
         for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
             let qv = Q4[q4 + j4];
             let kv = KC4[row4 + j4];
-            let q0 = unpack2x16float(qv.x);
-            let k0 = unpack2x16float(kv.x);
+            let q0 = unpack_h(qv.x);
+            let k0 = unpack_h(kv.x);
             dot = dot + (q0.x * k0.x + q0.y * k0.y);
-            let q1 = unpack2x16float(qv.y);
-            let k1 = unpack2x16float(kv.y);
+            let q1 = unpack_h(qv.y);
+            let k1 = unpack_h(kv.y);
             dot = dot + (q1.x * k1.x + q1.y * k1.y);
-            let q2 = unpack2x16float(qv.z);
-            let k2 = unpack2x16float(kv.z);
+            let q2 = unpack_h(qv.z);
+            let k2 = unpack_h(kv.z);
             dot = dot + (q2.x * k2.x + q2.y * k2.y);
-            let q3 = unpack2x16float(qv.w);
-            let k3 = unpack2x16float(kv.w);
+            let q3 = unpack_h(qv.w);
+            let k3 = unpack_h(kv.w);
             dot = dot + (q3.x * k3.x + q3.y * k3.y);
         }}
         sc[t] = dot * cfg.scale;
@@ -1262,7 +1608,7 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
         var a1 = 0.0;
         for (var t = t_idx; t < chunk_len; t = t + T_SPLIT) {{
             let row = kbase + (t_start + t) * D2;
-            let v = unpack2x16float(VC[row + jp]);
+            let v = unpack_h(VC[row + jp]);
             a0 = a0 + sc[t] * v.x;
             a1 = a1 + sc[t] * v.y;
         }}
@@ -1337,7 +1683,7 @@ fn gqa_merge(@builtin(workgroup_id) wgid: vec3<u32>,
                 a1 = a1 + w * POut[(maxbase + c) * D + lid.x * 2u + 1u];
             }}
         }}
-        Out[qh * D2 + lid.x] = pack2x16float(vec2<f32>(a0, a1));
+        Out[qh * D2 + lid.x] = pack_h(vec2<f32>(a0, a1));
     }}
 }}
 ",
@@ -1366,13 +1712,13 @@ fn argmax(@builtin(local_invocation_id) lid: vec3<u32>) {{
     var lmax = bitcast<f32>(0xFF800000u);
     var lidx = 0;
     for (var i = lid.x; i < n2; i = i + BS) {{
-        let v = unpack2x16float(X[i]);
+        let v = unpack_h(X[i]);
         let ix = i * 2u;
         if (v.x > lmax) {{ lmax = v.x; lidx = i32(ix); }}
         if (v.y > lmax) {{ lmax = v.y; lidx = i32(ix + 1u); }}
     }}
     if ((cfg.n & 1u) == 1u && lid.x == 0u) {{
-        let e = half_at(unpack2x16float(X[cfg.n >> 1u]), cfg.n - 1u);
+        let e = half_at(unpack_h(X[cfg.n >> 1u]), cfg.n - 1u);
         if (e > lmax) {{ lmax = e; lidx = i32(cfg.n - 1u); }}
     }}
     smax[lid.x] = lmax;
@@ -1539,7 +1885,7 @@ fn prefill_gemm_impl(
     s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
     s.push_str(
         "fn halve(w: u32, odd: bool) -> f32 {\n\
-         \x20 let p = unpack2x16float(w);\n\
+         \x20 let p = unpack_h(w);\n\
          \x20 return select(p.x, p.y, odd);\n\
          }\n",
     );
@@ -1715,14 +2061,14 @@ fn prefill_gemm_impl(
             // thread owns is exactly one word, so no half select is needed.
             if bias {
                 s.push_str(&format!(
-                    "v{i}{e} = v{i}{e} + unpack2x16float(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
+                    "v{i}{e} = v{i}{e} + unpack_h(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
                 ));
             }
             s.push_str(&format!(
-                "if (BETA == 1u) {{\n  let old = unpack2x16float(C[we{i}_{e}]);\n  v{i}{e} = v{i}{e} + old;\n}}\n"
+                "if (BETA == 1u) {{\n  let old = unpack_h(C[we{i}_{e}]);\n  v{i}{e} = v{i}{e} + old;\n}}\n"
             ));
             s.push_str(&format!(
-                "C[we{i}_{e}] = pack2x16float(v{i}{e});\n"
+                "C[we{i}_{e}] = pack_h(v{i}{e});\n"
             ));
         }
     }
@@ -1783,7 +2129,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 
     var lmax = bitcast<f32>(0xFF800000u);
     for (var j = lid.x; j < valid; j = j + BS) {{
-        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);
+        let v = half_at(unpack_h(X[base_x + (j >> 1u)]), j);
         let sc = v * scale;
         if (sc > lmax) {{ lmax = sc; }}
     }}
@@ -1798,7 +2144,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 
     var lsum = 0.0;
     for (var j = lid.x; j < valid; j = j + BS) {{
-        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);
+        let v = half_at(unpack_h(X[base_x + (j >> 1u)]), j);
         lsum = lsum + exp(v * scale - row_max);
     }}
     red_sum[lid.x] = lsum;
@@ -1817,14 +2163,14 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
         var e0 = 0.0;
         var e1 = 0.0;
         if (j0 < valid) {{
-            let v0 = half_at(unpack2x16float(X[base_x + w]), j0);
+            let v0 = half_at(unpack_h(X[base_x + w]), j0);
             e0 = exp(v0 * scale - row_max) * inv_sum;
         }}
         if (j1 < valid) {{
-            let v1 = half_at(unpack2x16float(X[base_x + w]), j1);
+            let v1 = half_at(unpack_h(X[base_x + w]), j1);
             e1 = exp(v1 * scale - row_max) * inv_sum;
         }}
-        Out[base_o + w] = pack2x16float(vec2<f32>(e0, e1));
+        Out[base_o + w] = pack_h(vec2<f32>(e0, e1));
     }}
 }}
 ",
@@ -1885,7 +2231,7 @@ fn slab_stats(@builtin(workgroup_id) wgid: vec3<u32>,
 
     var lmax = bitcast<f32>(0xFF800000u);
     for (var j = lid.x; j < valid; j = j + BS) {{
-        let sc = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j) * cfg.scale;
+        let sc = half_at(unpack_h(X[base_x + (j >> 1u)]), j) * cfg.scale;
         if (sc > lmax) {{ lmax = sc; }}
     }}
     red_max[lid.x] = lmax;
@@ -1899,7 +2245,7 @@ fn slab_stats(@builtin(workgroup_id) wgid: vec3<u32>,
 
     var lsum = 0.0;
     for (var j = lid.x; j < valid; j = j + BS) {{
-        let sc = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j) * cfg.scale;
+        let sc = half_at(unpack_h(X[base_x + (j >> 1u)]), j) * cfg.scale;
         lsum = lsum + exp(sc - row_max);
     }}
     red_sum[lid.x] = lsum;
@@ -1999,9 +2345,9 @@ fn slab_merge(@builtin(global_invocation_id) gid: vec3<u32>,
 
     var acc = vec2<f32>(0.0, 0.0);
     for (var t = 0u; t < cfg.n_slab; t = t + 1u) {{
-        acc = acc + Wt[t * (cfg.rows * NQH) + wi] * unpack2x16float(Part[t * (cfg.rows * NQH * HD2) + pi]);
+        acc = acc + Wt[t * (cfg.rows * NQH) + wi] * unpack_h(Part[t * (cfg.rows * NQH * HD2) + pi]);
     }}
-    Out[pi] = pack2x16float(acc);
+    Out[pi] = pack_h(acc);
 }}
 ",
         nqh = nqh,
@@ -2088,7 +2434,7 @@ pub fn audio_im2col() -> String {
 const OOB: u32 = {oob}u;
 
 fn scalar(addr: u32) -> f32 {{
-    let w = unpack2x16float(Input[addr / 2u]);
+    let w = unpack_h(Input[addr / 2u]);
     return select(w.x, w.y, (addr & 1u) == 1u);
 }}
 
@@ -2116,7 +2462,7 @@ fn im2col(@builtin(workgroup_id) wid: vec3<u32>,
     var x = vec2<f32>(0.0, 0.0);
     if (a != OOB) {{ x.x = scalar(src + a); }}
     if (b != OOB && p + 1u < cfg.plane) {{ x.y = scalar(src + b); }}
-    Cols[word] = pack2x16float(x);
+    Cols[word] = pack_h(x);
 }}
 ",
         oob = TAP_OOB
@@ -2170,22 +2516,22 @@ fn bias_gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     // which passes 65535 workgroups well before the 22-minute token cap.
     let i = gid.x + gid.y * (cfg.gx * 256u);
     if (i * 2u >= cfg.n) { return; }
-    let s = unpack2x16float(Src[i]);
+    let s = unpack_h(Src[i]);
     var b = vec2<f32>(0.0, 0.0);
     if (cfg.mode == 1u) {
         // Channel-major: both halves of the word are the same channel, one
         // channel per `words` words, and `Bias` is packed two channels per word
         // — so the channel's element is one *half* of `Bias[c/2]`, not `Bias[c]`.
         let c = i / cfg.words;
-        let w = unpack2x16float(Bias[c / 2u]);
+        let w = unpack_h(Bias[c / 2u]);
         let b0 = select(w.x, w.y, (c & 1u) == 1u);
         b = vec2<f32>(b0, b0);
     } else {
         // Token-major: the halves are adjacent columns of one row, and the
         // word's own two halves are exactly those two biases.
-        b = unpack2x16float(Bias[i % cfg.words]);
+        b = unpack_h(Bias[i % cfg.words]);
     }
-    Dst[i] = pack2x16float(vec2<f32>(gelu(s.x + b.x), gelu(s.y + b.y)));
+    Dst[i] = pack_h(vec2<f32>(gelu(s.x + b.x), gelu(s.y + b.y)));
 }
 "
     .to_string()
@@ -2214,22 +2560,22 @@ fn layernorm(@builtin(workgroup_id) wid: vec3<u32>) {
     let base = wid.x * (d / 2u);
     var mean = 0.0;
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + half_at(unpack2x16float(Src[base + j / 2u]), j);
+        mean = mean + half_at(unpack_h(Src[base + j / 2u]), j);
     }
     mean = mean / f32(d);
     var var_ = 0.0;
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let x = half_at(unpack2x16float(Src[base + j / 2u]), j) - mean;
+        let x = half_at(unpack_h(Src[base + j / 2u]), j) - mean;
         var_ = var_ + x * x;
     }
     var_ = var_ / f32(d);
     let inv = 1.0 / sqrt(var_ + cfg.eps);
     for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
         let j = w * 2u;
-        let s = unpack2x16float(Src[base + w]);
-        let g = unpack2x16float(Wgt[w]);
-        let b = unpack2x16float(Bia[w]);
-        Dst[base + w] = pack2x16float(vec2<f32>(
+        let s = unpack_h(Src[base + w]);
+        let g = unpack_h(Wgt[w]);
+        let b = unpack_h(Bia[w]);
+        Dst[base + w] = pack_h(vec2<f32>(
             (s.x - mean) * inv * g.x + b.x,
             (s.y - mean) * inv * g.y + b.y,
         ));
@@ -2337,23 +2683,23 @@ fn win_pack(@builtin(workgroup_id) wid: vec3<u32>,
         let t0 = win * cfg.wlen + 2u * rp;
         let i0 = t0 * (cfg.acols / 2u) + head * hd2 + jw;
         if (2u * rp < valid) {
-            q0 = unpack2x16float(Q[i0]);
-            k0 = unpack2x16float(K[i0]);
-            v0 = unpack2x16float(V[i0]);
+            q0 = unpack_h(Q[i0]);
+            k0 = unpack_h(K[i0]);
+            v0 = unpack_h(V[i0]);
         }
         if (2u * rp + 1u < valid) {
             let i1 = i0 + cfg.acols / 2u;
-            q1 = unpack2x16float(Q[i1]);
-            k1 = unpack2x16float(K[i1]);
-            v1 = unpack2x16float(V[i1]);
+            q1 = unpack_h(Q[i1]);
+            k1 = unpack_h(K[i1]);
+            v1 = unpack_h(V[i1]);
         }
     }
 
     // vp: one row per token, `pad_n/2` words wide, so the head-dim padding is
     // *inside* the row and these threads write the zeros for it.
     let vp = z * (cfg.wpad * (cfg.pad_n / 2u)) + (2u * rp) * (cfg.pad_n / 2u) + jw;
-    Vp[vp] = pack2x16float(v0);
-    Vp[vp + cfg.pad_n / 2u] = pack2x16float(v1);
+    Vp[vp] = pack_h(v0);
+    Vp[vp + cfg.pad_n / 2u] = pack_h(v1);
 
     // qp: the row is exactly `hd2` words with no padding, so a `jw` past the
     // row must not write at all — `Qp[qp]` would land in the *next* token's row
@@ -2362,16 +2708,16 @@ fn win_pack(@builtin(workgroup_id) wid: vec3<u32>,
     // real or zero).
     if (in_range) {
         let qp = z * (cfg.wpad * hd2) + (2u * rp) * hd2 + jw;
-        Qp[qp] = pack2x16float(q0);
-        Qp[qp + hd2] = pack2x16float(q1);
+        Qp[qp] = pack_h(q0);
+        Qp[qp + hd2] = pack_h(q1);
     }
 
     // kt: the transpose — row `j`, and the token pair in one word.  Only the
     // real `hd` rows exist; the rest would run into the next block.
     if (in_range) {
         let kt = z * (cfg.hd * wpad2) + j0 * wpad2 + rp;
-        Kt[kt] = pack2x16float(vec2<f32>(k0.x, k1.x));
-        Kt[kt + wpad2] = pack2x16float(vec2<f32>(k0.y, k1.y));
+        Kt[kt] = pack_h(vec2<f32>(k0.x, k1.x));
+        Kt[kt + wpad2] = pack_h(vec2<f32>(k0.y, k1.y));
     }
 }
 "
@@ -2416,20 +2762,20 @@ fn softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var mx = -3.0e38;
     for (var j: u32 = 0u; j < valid; j = j + 1u) {
-        mx = max(mx, half_at(unpack2x16float(Sc[base + j / 2u]), j) * cfg.scale);
+        mx = max(mx, half_at(unpack_h(Sc[base + j / 2u]), j) * cfg.scale);
     }
     var sum = 0.0;
     for (var j: u32 = 0u; j < valid; j = j + 1u) {
-        sum = sum + exp(half_at(unpack2x16float(Sc[base + j / 2u]), j) * cfg.scale - mx);
+        sum = sum + exp(half_at(unpack_h(Sc[base + j / 2u]), j) * cfg.scale - mx);
     }
     let inv = 1.0 / sum;
     for (var w: u32 = 0u; w < cfg.wpad / 2u; w = w + 1u) {
         let j0 = w * 2u;
         let j1 = j0 + 1u;
-        let v = unpack2x16float(Sc[base + w]);
+        let v = unpack_h(Sc[base + w]);
         let p0 = select(0.0, exp(v.x * cfg.scale - mx) * inv, j0 < valid);
         let p1 = select(0.0, exp(v.y * cfg.scale - mx) * inv, j1 < valid);
-        Out[base + w] = pack2x16float(vec2<f32>(p0, p1));
+        Out[base + w] = pack_h(vec2<f32>(p0, p1));
     }
 }
 "
@@ -2459,9 +2805,9 @@ fn add_pe(@builtin(workgroup_id) wid: vec3<u32>,
     let d2 = cfg.d / 2u;
     if (w >= d2) { return; }
     let tok = wid.x;
-    let v = unpack2x16float(H[tok * (cfg.s_pad / 2u) + w])
-          + unpack2x16float(Pe[(tok % cfg.tpc) * d2 + w]);
-    let packed = pack2x16float(v);
+    let v = unpack_h(H[tok * (cfg.s_pad / 2u) + w])
+          + unpack_h(Pe[(tok % cfg.tpc) * d2 + w]);
+    let packed = pack_h(v);
     Dst[tok * (cfg.s_pad / 2u) + w] = packed;
 }
 "
@@ -2495,7 +2841,7 @@ pub fn audio_permute_pe() -> String {
 @group(0) @binding(2) var<uniform>             cfg: PmCfg;
 
 fn half_at(addr: u32) -> f32 {
-    let v = unpack2x16float(C3[addr / 2u]);
+    let v = unpack_h(C3[addr / 2u]);
     return select(v.x, v.y, (addr & 1u) == 1u);
 }
 
@@ -2530,7 +2876,7 @@ fn permute_pe(@builtin(workgroup_id) wid: vec3<u32>,
         let v = half_at(src);
         if (e == 0u) { x.x = v; } else { x.y = v; }
     }
-    Dst[(cfg.tok0 + tok) * (cfg.s_pad / 2u) + w] = pack2x16float(x);
+    Dst[(cfg.tok0 + tok) * (cfg.s_pad / 2u) + w] = pack_h(x);
 }
 "
     .to_string()

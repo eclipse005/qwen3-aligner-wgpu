@@ -682,6 +682,12 @@ impl Gpu {
     /// instead of letting them turn into an opaque panic.  `layout` attaches an
     /// explicit pipeline layout — required when one bind group is shared across
     /// sibling pipelines, since wgpu's implicit layouts are pipeline-exclusive.
+    ///
+    /// The run's 16-bit storage format is prepended here, once, in front of
+    /// whatever the caller wrote: every kernel unpacks and packs through
+    /// `unpack_h` / `pack_h`, so the format is a single choice for the whole
+    /// process ([`crate::shaders::half`]) rather than a parameter on ~33 shader
+    /// builders.
     pub fn pipeline(
         &self,
         label: &str,
@@ -689,10 +695,11 @@ impl Gpu {
         entry: &str,
         layout: Option<&wgpu::PipelineLayout>,
     ) -> Result<wgpu::ComputePipeline> {
+        let source = format!("{}{wgsl}", crate::shaders::half().prelude());
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(label),

@@ -52,6 +52,7 @@ align --audio speech.wav --text "hello world" --language English --output out.js
 | `--output <json>` | 结果写成 JSON（`text` / `start_time` / `end_time`，单位秒）；不填则按 `词<TAB>开始<TAB>结束` 打印 |
 | `--model <dir>` | 模型目录（也可用环境变量 `QALIGN_MODEL`） |
 | `--device <name>` | 指定设备，默认自动；`cpu` 表示强制用 CPU |
+| `--dtype <f16\|bf16>` | 16 位权重与激活的存储格式。默认 `f16`：实测它才是能复现参考那一档 —— 对三份参考 gold 都没有一个「参考有唯一答案而我们不同」的端点；改成 `bf16`（checkpoint 自己的存储格式）反而更远。理由与交叉表见 `docs/perf.md` |
 | `--raw <json>` | 另外写出**修复前**的原始毫秒流（模型自己的 argmax），用于对照参考实现 |
 | `--list-devices` | 列出这台机器上可用的设备 |
 
@@ -75,6 +76,7 @@ for it in &items {
 | | |
 |---|---|
 | `Aligner::load(selector, model_dir)` | 加载模型；`selector` 用 `DeviceSelector::parse("auto")` 得到 |
+| `Aligner::load_with_dtype(selector, model_dir, half)` | 同上，并指定 16 位存储格式：`shaders::DEFAULT_HALF`（f16）或 `shaders::Half::Bf16`。格式必须在第一个 pipeline 建立前定下，这里在加载开头就设好 |
 | `align(audio, text, language)` | 对齐，返回 `Vec<AlignItem>` |
 | `align_with_raw(audio, text, language)` | 同上，另外给出修复前的原始时间戳（毫秒） |
 | `align_samples(&samples, text, language)` | 音频已解码好时用：16 kHz 单声道、取值范围 [-1, 1] |

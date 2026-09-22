@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use safetensors::Dtype;
 
 use crate::gpu::{BulkUpload, Gpu};
+use crate::half16::H16;
 use crate::shaders;
 use crate::weights::{self, PackedWeight};
 
@@ -270,7 +270,7 @@ struct EmbedCfg {
 
 /// Buffers and uniforms reused across the prefill pass.
 pub struct Scratch {
-    /// RoPE tables, `[rope_positions, head_dim]` f16.
+    /// RoPE tables, `[rope_positions, head_dim]`, in the run's storage format.
     pub cos: wgpu::Buffer,
     pub sin: wgpu::Buffer,
     u_rms: wgpu::Buffer,
@@ -317,6 +317,10 @@ struct Pipes {
     slab_stats: wgpu::ComputePipeline,
     slab_weights: wgpu::ComputePipeline,
     slab_merge: wgpu::ComputePipeline,
+    /// Measurement only: the f16/bf16 -> f32 widening copy behind
+    /// `QALIGN_DUMP_LAYERS` (see [`WgpuTextDecoder::prefill`]).  Built always —
+    /// it costs one pipeline — but dispatched only when the env var is set.
+    widen: wgpu::ComputePipeline,
 }
 
 /// KV slots allocated at load (112 KiB each, see [`WgpuTextDecoder::load`]).
@@ -389,8 +393,8 @@ pub struct WgpuTextDecoder {
     pipes: Pipes,
     pub scratch: Scratch,
 
-    /// The last layer's hidden states, `[s, hs]` f16 — what the caller reads
-    /// back after [`Self::prefill`].
+    /// The last layer's hidden states, `[s, hs]` in the run's storage format —
+    /// what the caller reads back after [`Self::prefill`].
     pub debug_prefill_h: Option<wgpu::Buffer>,
 }
 
@@ -432,6 +436,8 @@ impl WgpuTextDecoder {
         // dynamic: the slabbed path gives every key slab its own cfg slot
         let sm_pl = family_layout_dyn(&gpu, "softmax", &[(0, true), (1, false)], 2, true);
         let rk_pl = family_layout(&gpu, "repeat_kv", &[(0, true), (1, false)], 2);
+        // measurement dump: two storages + a per-dispatch uniform slot
+        let wd_pl = family_layout_dyn(&gpu, "widen_dump", &[(0, true), (1, false)], 2, true);
 
         // ── pipelines ─────────────────────────────────────────────────────
         let rms_bs = block_for_reduction(hs) as usize;
@@ -471,6 +477,7 @@ impl WgpuTextDecoder {
                 "slab_merge",
                 Some(&family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3)),
             )?,
+            widen: build("widen_dump", &shaders::widen_h16_f32(), "widen", Some(&wd_pl))?,
         };
 
         // ── scratch ───────────────────────────────────────────────────────
@@ -607,8 +614,9 @@ impl WgpuTextDecoder {
         self.cap
     }
 
-    /// Upload MRoPE tables — `[rope_positions, head_dim]` f16, row-major.
-    pub fn set_rope_tables(&self, cos: &[half::f16], sin: &[half::f16]) {
+    /// Upload MRoPE tables — `[rope_positions, head_dim]` in the run's 16-bit
+    /// storage format, row-major.
+    pub fn set_rope_tables(&self, cos: &[H16], sin: &[H16]) {
         self.gpu.upload(&self.scratch.cos, &weights::words_bytes(cos));
         self.gpu.upload(&self.scratch.sin, &weights::words_bytes(sin));
     }
@@ -634,12 +642,14 @@ impl WgpuTextDecoder {
         (gx, gy)
     }
 
-    /// Read any scratch buffer back as f16 values.
-    pub fn read_f16(&self, buf: &wgpu::Buffer, elems: usize) -> Result<Vec<half::f16>> {
+    /// Read any scratch buffer back as 16-bit values in the run's format — the
+    /// values the kernels actually round to, which is what the reference's own
+    /// dtype holds.
+    pub fn read_h16(&self, buf: &wgpu::Buffer, elems: usize) -> Result<Vec<H16>> {
         let bytes = self.gpu.readback(buf, (elems * 2) as u64)?;
         Ok(bytes
             .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+            .map(|c| H16::from_le_bytes([c[0], c[1]]))
             .collect())
     }
 
@@ -705,8 +715,8 @@ fn upload_weight(up: &mut BulkUpload, label: &str, w: &PackedWeight) -> Result<w
     Ok(b)
 }
 
-/// f16 vector -> `array<u32>` binding.
-fn upload_vec(up: &mut BulkUpload, label: &str, v: &[half::f16]) -> Result<wgpu::Buffer> {
+/// 16-bit vector in the run's format -> `array<u32>` binding.
+fn upload_vec(up: &mut BulkUpload, label: &str, v: &[H16]) -> Result<wgpu::Buffer> {
     let b = up.storage(label, (v.len() * 2) as u64);
     up.upload(&b, &weights::words_bytes(v))?;
     Ok(b)
@@ -724,10 +734,10 @@ struct LayerWeights {
     o: PackedWeight,
     gu: Vec<(u64, bytes::Bytes)>,
     dp: PackedWeight,
-    iln: Vec<half::f16>,
-    pln: Vec<half::f16>,
-    qn: Vec<half::f16>,
-    kn: Vec<half::f16>,
+    iln: Vec<H16>,
+    pln: Vec<H16>,
+    qn: Vec<H16>,
+    kn: Vec<H16>,
 }
 
 /// Read one layer's tensors out of the checkpoint in upload-ready form.
@@ -737,10 +747,10 @@ fn convert_layer(w: &HashMap<String, weights::RawTensor>, p: &str) -> Result<Lay
         dp: weights::get_matrix(w, &format!("{p}.mlp.down_proj.weight"))?,
         qkv: fused_pieces(w, &format!("{p}.self_attn"), &["q_proj", "k_proj", "v_proj"])?,
         gu: fused_pieces(w, &format!("{p}.mlp"), &["gate_proj", "up_proj"])?,
-        iln: weights::get_vector(w, &format!("{p}.input_layernorm.weight"))?,
-        pln: weights::get_vector(w, &format!("{p}.post_attention_layernorm.weight"))?,
-        qn: weights::get_vector(w, &format!("{p}.self_attn.q_norm.weight"))?,
-        kn: weights::get_vector(w, &format!("{p}.self_attn.k_norm.weight"))?,
+        iln: weights::get_h16_vector(w, &format!("{p}.input_layernorm.weight"))?,
+        pln: weights::get_h16_vector(w, &format!("{p}.post_attention_layernorm.weight"))?,
+        qn: weights::get_h16_vector(w, &format!("{p}.self_attn.q_norm.weight"))?,
+        kn: weights::get_h16_vector(w, &format!("{p}.self_attn.k_norm.weight"))?,
     })
 }
 
@@ -749,10 +759,11 @@ fn convert_layer(w: &HashMap<String, weights::RawTensor>, p: &str) -> Result<Lay
 ///
 /// The concatenation used to be a `PackedWeight` of its own: a full copy of
 /// every fused matrix made purely so the upload could see one slice.  The
-/// kernels only need the parts to be *contiguous*, so an f16 checkpoint
-/// contributes its own mapped bytes at their offsets (no copy at all), and a
-/// bf16/f32 one is narrowed straight into the fused layout — without the
-/// per-part buffers the piecewise version needed.
+/// kernels only need the parts to be *contiguous*, so a checkpoint already in
+/// the run's format contributes its own mapped bytes at their offsets (no copy
+/// at all — the bf16 checkpoint in the default bf16 mode), and any other dtype
+/// is narrowed straight into the fused layout, without the per-part buffers the
+/// piecewise version needed.
 fn fused_pieces(
     w: &HashMap<String, weights::RawTensor>,
     prefix: &str,
@@ -767,7 +778,7 @@ fn fused_pieces(
         })
         .collect::<Result<_>>()?;
 
-    if tensors.iter().all(|t| t.dtype == Dtype::F16) {
+    if tensors.iter().all(|t| t.dtype == weights::storage_dtype()) {
         let mut pieces = Vec::with_capacity(tensors.len());
         let mut off = 0u64;
         for t in &tensors {
@@ -781,7 +792,7 @@ fn fused_pieces(
     for t in &tensors {
         let start = out.len();
         out.resize(start + t.data.len() / t.dtype.size() * 2, 0);
-        t.narrow_f16_into(&mut out[start..])?;
+        t.narrow_h16_into(&mut out[start..])?;
     }
     Ok(vec![(0, out.into())])
 }
@@ -802,16 +813,16 @@ fn fused_bytes(tensors: &[&weights::RawTensor]) -> Result<usize> {
 // ═══════════════════════════════════════════════════════════════════════
 
 impl WgpuTextDecoder {
-    /// Prefill: run `s` input positions (hidden states `[s, hs]` f16
-    /// little-endian words) through every layer with causal attention, writing
-    /// KV slots `kv_start..kv_start+s`, and leave the last layer's output in
-    /// [`Self::debug_prefill_h`] for the caller to read back.
+    /// Prefill: run `s` input positions (hidden states `[s, hs]` as little-endian
+    /// words in the run's 16-bit format) through every layer with causal
+    /// attention, writing KV slots `kv_start..kv_start+s`, and leave the last
+    /// layer's output in [`Self::debug_prefill_h`] for the caller to read back.
     ///
     /// This repo has no decode loop, so there is no first token to return and no
     /// LM head to run — the pass ends with the hidden states.
     ///
-    /// f32 accumulation with f16 rounding between ops; the accumulation order is
-    /// this path's own.
+    /// f32 accumulation with one 16-bit rounding between ops; the accumulation
+    /// order is this path's own.
     #[allow(clippy::too_many_lines)]
     pub fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<()> {
         let cfg = self.cfg.clone();
@@ -901,10 +912,46 @@ impl WgpuTextDecoder {
         // slab_stats, then the layer-independent weights and merge cfgs
         let u_sl = up.uniform("p.sl", (2 * MAX_SLAB as u64 + 2) * 256);
         let u_rk = up.uniform("p.rk", 32);
+        // ── measurement dump (QALIGN_DUMP_LAYERS) ────────────────────────────
+        // Off unless the env var names a file.  One f32 slab per layer index
+        // holding the running hidden state (`h`, in the run's 16-bit format) at
+        // each layer boundary, widened on the device, so a profile can be read
+        // off against a torch reference layer by layer.  Nothing else in the
+        // pass reads or writes these two buffers, so the arithmetic, the buffer
+        // sizes and the dispatch order of every other kernel are untouched.
+        let dump_path = std::env::var("QALIGN_DUMP_LAYERS")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+        let dump_h = dump_path
+            .as_ref()
+            .map(|_| up.storage("p.dump_h", (self.layers.len() + 1) as u64 * (mp * hs) as u64 * 4));
+        let u_wd = dump_path
+            .as_ref()
+            .map(|_| up.uniform("p.wd", ((self.layers.len() + 1) * 256) as u64));
         up.upload(&h_buf, hidden_words)?;
         up.finish()?;
 
         let gpu = &self.gpu;
+        let dump_grid = dump_h
+            .as_ref()
+            .map(|_| grid_xy((mp * hs / 2).div_ceil(256)));
+        if let (Some(u_wd), Some(grid)) = (u_wd.as_ref(), dump_grid) {
+            // One cfg slot per dispatch: `write_buffer` copies are all retired at
+            // submit start, so a single reused slot would give every dispatch the
+            // last value written (the same reason `u_gd` carries 256 of them).
+            for li in 0..=self.layers.len() {
+                gpu.write_at(
+                    u_wd,
+                    (li * 256) as u64,
+                    bytemuck::bytes_of(&WidenCfg {
+                        words: (mp * hs / 2) as u32,
+                        src0: 0,
+                        dst0: (li * mp * hs) as u32,
+                        gx: grid.0,
+                    }),
+                );
+            }
+        }
         // `coff` = element offset of C's batch 0 — non-zero only for the slabbed
         // AV GEMM, whose per-slab outputs all live in one buffer.
         let gemm_bg = |pipe: &wgpu::ComputePipeline,
@@ -1148,6 +1195,39 @@ impl WgpuTextDecoder {
                 }
             }};
         }
+        // Measurement dump: copy `h` (16-bit storage) into dump slab `slot`,
+        // widened to f32.  A no-op when `QALIGN_DUMP_LAYERS` is unset, and never
+        // on a `QALIGN_SKIP` list — it is instrumentation, not a GEMM.
+        macro_rules! dump_layer {
+            ($cp:expr, $slot:expr) => {{
+                if let (Some(d), Some(u), Some(g)) = (dump_h.as_ref(), u_wd.as_ref(), dump_grid) {
+                    let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("p.widen"),
+                        layout: &self.pipes.widen.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: h_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: d.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: u,
+                                    offset: 0,
+                                    size: std::num::NonZeroU64::new(32),
+                                }),
+                            },
+                        ],
+                    });
+                    $cp.set_pipeline(&self.pipes.widen);
+                    $cp.set_bind_group(0, &bg, &[($slot * 256) as u32]);
+                    $cp.dispatch_workgroups(g.0, g.1, 1);
+                }
+            }};
+        }
+
+        // Layer index 0 of the dump is the state the first layer's input norm
+        // reads: the embedding rows with the audio frames scattered in, before
+        // any layer has run.
+        dump_layer!(cp, 0);
 
         for (li, layer) in self.layers.iter().enumerate() {
             // 1. rms_norm(h, iln) → normed   [s, hs]
@@ -1503,6 +1583,9 @@ impl WgpuTextDecoder {
                 (hs / 128) as u32, (mp / 128) as u32, 1
             );
 
+            // Measurement dump: `h` now holds layer `li`'s output.
+            dump_layer!(cp, li + 1);
+
             // Long prefills (s>=512) must submit+poll or a hung submit hits the
             // WDDM TDR watchdog and device-loses.  The interval is in *layers* but
             // the driver times wall clock, so the slabbed path submits twice as
@@ -1539,6 +1622,63 @@ impl WgpuTextDecoder {
         // The caller reads the hidden states back out of this buffer; it stays
         // alive (stored in the struct) until the next prefill replaces it.
         self.debug_prefill_h = Some(h_buf);
+
+        // ── measurement dump: hand the f32 layer stack to the comparison ──────
+        if let (Some(path), Some(d)) = (dump_path.as_ref(), dump_h.as_ref()) {
+            let n = self.layers.len() + 1;
+            let bytes = self
+                .gpu
+                .readback(d, n as u64 * (mp * hs) as u64 * 4)
+                .context("read back QALIGN_DUMP_LAYERS")?;
+            write_layer_dump(path, &bytes, n, s, mp, hs)?;
+        }
         Ok(())
     }
+}
+
+/// CFG for [`shaders::widen_h16_f32`] — word count plus the source word offset
+/// and the destination *element* offset.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct WidenCfg {
+    words: u32,
+    src0: u32,
+    dst0: u32,
+    gx: u32,
+}
+
+/// Write a measurement layer stack as raw little-endian f32 plus a `.json`
+/// sidecar describing the shape (the task's "raw `.bin` + sidecar" option —
+/// nothing here needs a container format, and numpy reads it with `fromfile`).
+///
+/// The buffer is the device's `[n, mp, hs]` tile layout, padding rows included:
+/// the sidecar carries `rows_padded` so the reader can slice the first `seq`
+/// rows without guessing, and `layer_stride_elems` is the padded stride.
+fn write_layer_dump(
+    path: &str,
+    bytes: &[u8],
+    layers: usize,
+    seq: usize,
+    mp: usize,
+    hs: usize,
+) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("write {path}"))?;
+    let meta = serde_json::json!({
+        "kind": "layer_hidden",
+        "shape": [layers, seq, hs],
+        "shape_padded": [layers, mp, hs],
+        "dtype": "float32",
+        "order": "layer-major, then row-major ([layer][row][hidden])",
+        "row_stride_elems": hs,
+        "layer_stride_elems": mp * hs,
+        "rows_padded": mp,
+        "half": crate::shaders::half().name(),
+        "note": "hidden state at every layer boundary of the text decoder's prefill, in the run's 16-bit storage rounding, widened to f32 on the device through unpack_h (values, not bits); index 0 is the state the first layer's input norm reads (embeddings with audio rows scattered in); rows >= shape[1] are tile padding",
+        "bytes": bytes.len(),
+    });
+    let side = format!("{path}.json");
+    std::fs::write(&side, serde_json::to_string_pretty(&meta)?)
+        .with_context(|| format!("write {side}"))?;
+    eprintln!("[dump] QALIGN_DUMP_LAYERS: {layers} layers x {seq} rows ({mp} padded) -> {path} (+ .json)");
+    Ok(())
 }

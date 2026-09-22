@@ -10,6 +10,10 @@
 //!   attention output); reproducing exactly those roundings is what makes the
 //!   transcripts agree.  The *order* of the f32 accumulation inside a dot
 //!   product is deliberately different.
+//! * **`--dtype` does not reach this path.**  Its f16 is a property of this
+//!   implementation, not of the checkpoint, so a `--dtype bf16` run over the CPU
+//!   decoder still computes in f16 — `align_inference::Backend::half` is where
+//!   that is decided.
 
 use std::collections::HashMap;
 use std::path::Path;
