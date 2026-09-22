@@ -178,7 +178,7 @@ USAGE:
 
 OPTIONS:
   --model <dir>    checkpoint directory; default `QALIGN_MODEL`, else
-                   D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-tf.
+                   D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-hf.
   --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
   --dtype <f16|bf16>
                    storage format for the 16-bit weights and activations.  f16

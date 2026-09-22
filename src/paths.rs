@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// original-layout repository stores different tensor names and will not load.
 pub fn model_dir() -> PathBuf {
     env_path("QALIGN_MODEL")
-        .unwrap_or_else(|| PathBuf::from(r"D:\Qwen3-ASR\models\Qwen3-ForcedAligner-0.6B-tf"))
+        .unwrap_or_else(|| PathBuf::from(r"D:\Qwen3-ASR\models\Qwen3-ForcedAligner-0.6B-hf"))
 }
 
 /// The test fixture wavs: `15s_en`, `30s_zh`, `90s_en`, `90s_ja`, `180s_en`,
