@@ -299,6 +299,49 @@ mod tests {
         assert!(y.iter().any(|v| *v != 0.0));
     }
 
+    /// Blocking the input is a scheduling change, not an arithmetic one: the
+    /// filter's state carries across calls, so the samples must come out
+    /// **bit for bit** the same as feeding the clip in one call.
+    ///
+    /// This is the whole licence for [`IN_BLOCK`].  Every timestamp downstream is
+    /// an argmax over a mel that starts here, and a one-ULP difference in the
+    /// resampler has moved a timestamp before — see the note on
+    /// `fast_pcm16_equals_hound_for_every_fixture`.  A content-rich signal is
+    /// used on purpose: blocking could only ever show up where the filter has
+    /// something to carry.
+    #[test]
+    fn block_fed_resample_is_bit_identical() {
+        use std::f32::consts::TAU;
+        // 6 s at 44.1 kHz: long enough for many blocks, short enough to stay a
+        // unit test.  Two tones plus a step keep the filter's history busy.
+        let n = 44_100 * 6;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 44_100.0;
+                let tone = (t * 3000.0 * TAU).sin() * 0.5 + (t * 9000.0 * TAU).sin() * 0.3;
+                tone + if i % 7_000 < 3_500 { 0.2 } else { -0.2 }
+            })
+            .collect();
+
+        let one_shot = resample_soxr_in_blocks(&x, 44_100, 16_000, usize::MAX).unwrap();
+        let blocked = resample_soxr_in_blocks(&x, 44_100, 16_000, IN_BLOCK).unwrap();
+        assert_eq!(one_shot.len(), blocked.len(), "blocked run changed the length");
+        for (i, (a, b)) in one_shot.iter().zip(&blocked).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {i}: one-shot {a} vs blocked {b}"
+            );
+        }
+
+        // And a block size that does not divide the input, so the tail path is
+        // covered too.
+        let odd = resample_soxr_in_blocks(&x, 44_100, 16_000, 1_000).unwrap();
+        assert_eq!(odd.len(), one_shot.len());
+        for (i, (a, b)) in one_shot.iter().zip(&odd).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i} differs with a 1000-sample block");
+        }
+    }
 }
 
 pub fn load_audio_wav(path: impl AsRef<std::path::Path>, target_sr: u32) -> anyhow::Result<Vec<f32>> {
@@ -490,7 +533,42 @@ mod fast_reader_tests {
 /// Resample with soxr HQ, `librosa`-style: soxr then `fix_length` to
 /// `ceil(n * target / orig)`.  `soxr_oneshot` defaults to LQ, so the quality
 /// must be passed explicitly.
+///
+/// Fed in [`IN_BLOCK`]-sized bites rather than all at once — see
+/// [`resample_soxr_in_blocks`] for why, and `block_fed_resample_is_bit_identical`
+/// for the proof that the answer does not depend on it.
 fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f32>> {
+    // `QALIGN_SOXR_ONESHOT=1` restores the one-shot feeding, so the two arms of
+    // an A/B can be measured on one binary with one env switch and nothing else
+    // differing.
+    let block = match std::env::var("QALIGN_SOXR_ONESHOT").as_deref() {
+        Ok("1") | Ok("on") | Ok("yes") => usize::MAX,
+        _ => IN_BLOCK,
+    };
+    resample_soxr_in_blocks(mono, sr, target_sr, block)
+}
+
+/// Input samples per `soxr_process` call: 16 KiB of f32.
+///
+/// soxr's DFT stage has a working set that stops fitting in cache when it is
+/// handed the whole clip, and the cost then grows much faster than the clip
+/// does: on this machine a 90 s 48 kHz clip cost **438 ms** one-shot and a
+/// 3-minute 44.1 kHz one **970 ms**, while the 16 kHz fixtures — where
+/// `finish_audio` returns before reaching soxr at all — cost 4 and 6 ms for the
+/// same read and downmix.  Blocking the input takes that arithmetic back to
+/// single-digit milliseconds.  The resampler's filter state is continuous across
+/// calls, so this is a scheduling change and not an arithmetic one.
+const IN_BLOCK: usize = 16 * 1024 / 4;
+
+/// The resampler, with the input block size exposed.  `in_block` larger than the
+/// clip means one call — the shape this used to have, kept reachable so the
+/// blocked and the one-shot feeding can be compared bit for bit.
+fn resample_soxr_in_blocks(
+    mono: &[f32],
+    sr: u32,
+    target_sr: u32,
+    in_block: usize,
+) -> anyhow::Result<Vec<f32>> {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_uint, c_ulong, c_void};
 
@@ -581,11 +659,12 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
             let mut odone = 0usize;
             let remain_out = out.len() - written;
             anyhow::ensure!(remain_out > 0, "soxr output overflow");
+            let take = (mono.len() - in_off).min(in_block);
             let err = unsafe {
                 soxr_process(
                     soxr,
                     mono[in_off..].as_ptr().cast(),
-                    mono.len() - in_off,
+                    take,
                     &mut idone,
                     out[written..].as_mut_ptr().cast(),
                     remain_out,
