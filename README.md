@@ -1,62 +1,80 @@
-# qwen3-aligner-wgpu
+# Qwen3-Aligner wgpu
 
-[Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) 的 Rust 实现，基于 wgpu（官方项目见 [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)）。
+**Qwen3-ForcedAligner forced alignment in Rust with wgpu.**
 
-强制对齐是转写的逆过程：给它一段音频**和**这段音频的转录文本，它给出每个词/字在音频里的起止时间。整个对齐是一次前向计算，没有逐字生成的循环；有 GPU 时跑在 GPU 上，没有时自动用 CPU。
+**English** · [简体中文](README.zh-CN.md)
 
-## 安装
+A lightweight, cross-platform Rust implementation of [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) (from the official [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) project), using [wgpu](https://github.com/gfx-rs/wgpu) for GPU acceleration.
 
-作为依赖加入 `Cargo.toml`：
+The goal is simple: given audio **and** its transcript, produce the start and end time of every word or character — **locally and natively**, without Python or vendor-specific GPU runtimes. The entire alignment is a single forward pass.
+
+### Features
+
+* 🦀 Pure Rust
+* 🎮 GPU acceleration with wgpu
+* 🌍 Cross-platform GPU support
+* 🖥️ Windows / macOS / Linux
+* ⚡ CPU fallback
+* 📦 Offline local inference
+* ⏱️ Word-level start / end timestamps
+* 🗣️ 11 languages
+* 🇯🇵 Japanese word segmentation built in
+* 🧩 CLI + Rust library
+
+### Install
+
+As a Cargo dependency:
 
 ```toml
 [dependencies]
-qwen3-aligner-wgpu = { git = "https://github.com/eclipse005/qwen-aligner-wgpu.git" }
+qwen3-aligner-wgpu = { git = "https://github.com/eclipse005/qwen3-aligner-wgpu.git" }
 ```
 
-构建命令行工具：
+Or build the CLI from source:
 
 ```bash
-cargo build --release        # 得到 target/release/align
+git clone https://github.com/eclipse005/qwen3-aligner-wgpu.git
+cd qwen3-aligner-wgpu
+cargo build --release        # target/release/align
 ```
 
-| Feature | 说明 |
-|---------|------|
-| `ja`（默认开启） | 日语分词。内置纯 Rust 的 nagisa，词表和模型直接编译进二进制；关掉后其它语言照常工作，只有日语会报错 |
+| Feature | Description |
+|---------|-------------|
+| `ja` (on by default) | Japanese word segmentation via a pure-Rust nagisa compiled into the binary. Disabling it keeps every other language working; only Japanese requests return an error |
 
-## 模型下载
+### Model download
 
-从 ModelScope 下载 **`-hf`** 那份（版权归原作者）：
+Weights are **not** included in this repository. Download the checkpoint whose name ends in **`-hf`** from ModelScope (rights remain with the original authors):
 
 ```python
 from modelscope import snapshot_download
 snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B-hf',
-                  local_dir=r'models/Qwen3-ForcedAligner-0.6B')
+                  local_dir='models/Qwen3-ForcedAligner-0.6B')
 ```
 
-ModelScope 上有两个同名仓库，要选 `-hf` 结尾的那个；另一个是旧布局，这里加载不了。
+ModelScope hosts two repos under the same name — use the one ending in `-hf`; the other uses the old layout and cannot be loaded.
 
-## 使用
-
-### 命令行
+### Quick Start
 
 ```bash
-align --audio speech.wav --text transcript.txt --language English
-align --audio speech.wav --text "hello world" --language English --output out.json
+align --audio speech.wav --text "hello world" --language English
+align --audio speech.wav --text transcript.txt --language English --output out.json
 ```
 
-| 参数 | 说明 |
-|------|------|
-| `--audio <file>` | 音频文件（WAV） |
-| `--text <file/文本>` | 转录文本：填一个存在的文件路径就读文件，否则把参数本身当文本 |
-| `--language <name>` | 语言，如 `English`、`Chinese`；日语/韩语要靠它走对应的分词 |
-| `--output <json>` | 结果写成 JSON（`text` / `start_time` / `end_time`，单位秒）；不填则按 `词<TAB>开始<TAB>结束` 打印 |
-| `--model <dir>` | 模型目录（也可用环境变量 `QALIGN_MODEL`） |
-| `--device <name>` | 指定设备，默认自动；`cpu` 表示强制用 CPU |
-| `--dtype <f16\|bf16>` | 16 位权重与激活的存储格式。默认 `f16`：实测它才是能复现参考那一档 —— 对三份参考 gold 都没有一个「参考有唯一答案而我们不同」的端点；改成 `bf16`（checkpoint 自己的存储格式）反而更远。理由与交叉表见 `docs/perf.md` |
-| `--raw <json>` | 另外写出**修复前**的原始毫秒流（模型自己的 argmax），用于对照参考实现 |
-| `--list-devices` | 列出这台机器上可用的设备 |
+Each result item carries `text`, `start_time` and `end_time` in seconds.
 
-### 作为库
+| Option | Description |
+|--------|-------------|
+| `--audio <file>` | Audio file (WAV) |
+| `--text <file/text>` | Transcript: an existing path is read as a file, otherwise the argument is used as text |
+| `--language <name>` | Language such as `English`, `Chinese`; Japanese and Korean rely on it for tokenization |
+| `--output <json>` | Write results as JSON; without it, results print as `word<TAB>start<TAB>end` |
+| `--model <dir>` | Model directory (or the `QALIGN_MODEL` environment variable) |
+| `--device <name>` | Force a device; `cpu` forces CPU. Default picks the best available |
+| `--dtype <f16\|bf16>` | Storage format for 16-bit weights and activations. Defaults to `f16`, which reproduces the reference implementation most closely; `bf16` is accepted for checkpoints stored that way |
+| `--list-devices` | List the devices usable on this machine |
+
+### Library
 
 ```rust
 use qwen3_aligner_wgpu::align_inference::Aligner;
@@ -69,60 +87,49 @@ for it in &items {
 }
 ```
 
-## API
+`AlignItem` carries `text`, `start_time` and `end_time` (seconds). `align` takes `&mut self` — one instance performs one alignment at a time. Also available: `align_samples` for in-memory 16 kHz mono audio, `align_with_raw` for the pre-fix raw timestamps, `load_with_dtype` to select the 16-bit storage format, and `split_words` / `decode_timestamps` / `fix_timestamps` for pipeline-level control. See `cargo doc` for the full API.
 
-### `Aligner`
+### Audio input
 
-| | |
-|---|---|
-| `Aligner::load(selector, model_dir)` | 加载模型；`selector` 用 `DeviceSelector::parse("auto")` 得到 |
-| `Aligner::load_with_dtype(selector, model_dir, half)` | 同上，并指定 16 位存储格式：`shaders::DEFAULT_HALF`（f16）或 `shaders::Half::Bf16`。格式必须在第一个 pipeline 建立前定下，这里在加载开头就设好 |
-| `align(audio, text, language)` | 对齐，返回 `Vec<AlignItem>` |
-| `align_with_raw(audio, text, language)` | 同上，另外给出修复前的原始时间戳（毫秒） |
-| `align_samples(&samples, text, language)` | 音频已解码好时用：16 kHz 单声道、取值范围 [-1, 1] |
-| `supported_languages()` | 支持的语言（11 种） |
-
-```rust
-pub struct AlignItem {
-    pub text: String,      // 词 / 字
-    pub start_time: f64,   // 开始时间，秒
-    pub end_time: f64,     // 结束时间，秒
-}
-```
-
-`align` 取 `&mut self`，一个实例同时只做一次对齐。
-
-### 其它导出
-
-- `list_devices()`：列出可用设备
-- `load_audio_wav(path, sample_rate)`：读 wav，必要时重采样
-- `split_words(text, language)`：按模型的时间戳粒度分词（见下）
-- `decode_timestamps(words, raw_ms)` / `fix_timestamps(ms)`：把原始时间戳整理成 `AlignItem`
-
-## 音频输入
-
-推荐 **16 kHz 单声道 WAV**——这是模型的原生采样率，不做任何重采样。其它采样率会自动转成 16 kHz，对结果要求严格的话可以先用 ffmpeg 转好：
+16 kHz mono WAV is recommended — the model's native sample rate, used without resampling. Any other sample rate is converted automatically; convert it yourself first with ffmpeg when full control matters:
 
 ```bash
 ffmpeg -i input.flac -ar 16000 -ac 1 -c:a pcm_f32le output.wav
 ```
 
-目前只支持 WAV。
+Only WAV is currently supported.
 
-## 分词粒度
+### Timestamp granularity
 
-时间戳的粒度就是分词的粒度，不同语言切法不同：
+The timestamp granularity equals the tokenization granularity, which differs by language:
 
-| 语言 | 怎么切 |
-|------|--------|
-| 日语 | 按词素切（`女子` / `アナ` / `の` / `仕事`），不是一个字一个 |
-| 韩语 | 按空格切，一整段算一个 |
-| 中文 / 英文 / 混合 | 每个汉字算一个，其余按空格切；标点会被丢掉但不拆词（`50-minute` 切出来是 `50minute`） |
+| Language | Tokenization |
+|----------|--------------|
+| Japanese | by morpheme (`女子` / `アナ` / `の` / `仕事`) |
+| Korean | one token per space-separated chunk |
+| Chinese | one token per character |
+| Other languages / mixed | whitespace-separated; punctuation is dropped but words are not split (`50-minute` becomes `50minute`) |
 
-## License
+### Why wgpu?
 
-Apache-2.0。`third_party/soxr` 下的重采样器是 LGPL-2.1-or-later，协议见该目录。
+Instead of relying on CUDA, ROCm, or other vendor-specific runtimes, this project uses **wgpu** as a unified GPU abstraction.
 
-## 致谢
+This makes it possible to build a single Rust-based alignment runtime for different platforms and GPU vendors.
 
-本仓库是**独立的 Rust 推理实现**，用于加载并运行官方发布的 Qwen3-ForcedAligner 权重，**不是** Alibaba / Qwen 官方发行版，与原作者无隶属关系。使用模型权重时请遵守原作者的许可证。转写（语音识别）见同系列的 [qwen3-asr-wgpu](https://github.com/eclipse005/qwen3-asr-wgpu)。
+### Project Status
+
+🚧 **Active development**
+
+Performance and hardware compatibility are still being actively optimized and tested across different GPUs.
+
+### Related
+
+* [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) — the official model project
+* [wgpu](https://github.com/gfx-rs/wgpu)
+* [qwen3-asr-wgpu](https://github.com/eclipse005/qwen3-asr-wgpu) — speech recognition (transcription)
+
+### License
+
+Apache-2.0. The resampler under `third_party/soxr` is LGPL-2.1-or-later; see that directory for details.
+
+This repository is an **independent Rust inference implementation** for loading and running the officially released Qwen3-ForcedAligner weights — not an official Alibaba / Qwen release, and not affiliated with the original authors. Model weights remain under the terms of their respective owners.
