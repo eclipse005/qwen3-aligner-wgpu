@@ -70,7 +70,7 @@ Each result item carries `text`, `start_time` and `end_time` in seconds.
 | `--language <name>` | Language such as `English`, `Chinese`; Japanese and Korean rely on it for tokenization |
 | `--output <json>` | Write results as JSON; without it, results print as `word<TAB>start<TAB>end` |
 | `--model <dir>` | Model directory (or the `QALIGN_MODEL` environment variable) |
-| `--device <name>` | Force a device; `cpu` forces CPU. Default picks the best available |
+| `--device <name>` | `auto` (default: GPU, or CPU when none opens), `cpu`, `gpu` (error if no GPU opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--dtype <f16\|bf16>` | Storage format for 16-bit weights and activations. Defaults to `f16`, which reproduces the reference implementation most closely; `bf16` is accepted for checkpoints stored that way |
 | `--list-devices` | List the devices usable on this machine |
 
@@ -78,9 +78,9 @@ Each result item carries `text`, `start_time` and `end_time` in seconds.
 
 ```rust
 use qwen3_aligner_wgpu::align_inference::Aligner;
-use qwen3_aligner_wgpu::gpu::DeviceSelector;
+use qwen3_aligner_wgpu::gpu::Backend;
 
-let mut aligner = Aligner::load(DeviceSelector::parse("auto")?, std::path::Path::new("model"))?;
+let mut aligner = Aligner::load_backend(Backend::parse("auto")?, std::path::Path::new("model"))?;
 let items = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some("English"))?;
 for it in &items {
     println!("{:.3}s - {:.3}s  {}", it.start_time, it.end_time, it.text);

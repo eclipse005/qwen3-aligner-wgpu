@@ -8,9 +8,9 @@
 //!
 //! ```no_run
 //! use qwen3_aligner_wgpu::align_inference::Aligner;
-//! use qwen3_aligner_wgpu::gpu::DeviceSelector;
+//! use qwen3_aligner_wgpu::gpu::Backend;
 //! # fn main() -> anyhow::Result<()> {
-//! let mut aligner = Aligner::load(DeviceSelector::parse("auto")?, std::path::Path::new("model"))?;
+//! let mut aligner = Aligner::load_backend(Backend::parse("auto")?, std::path::Path::new("model"))?;
 //! let items = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some("English"))?;
 //! # Ok(()) }
 //! ```
@@ -48,7 +48,7 @@ pub mod shaders;
 pub mod weights;
 pub mod words;
 
-pub use gpu::{list_devices, DeviceInfo, DeviceSelector, Gpu};
+pub use gpu::{list_devices, Backend, DeviceInfo, DeviceSelector, Gpu};
 pub use mel::load_audio_wav;
 pub use postprocess::{decode_timestamps, fix_timestamps, AlignItem};
 pub use words::split_words;

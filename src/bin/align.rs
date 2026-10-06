@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use qwen3_aligner_wgpu::align_inference::Aligner;
-use qwen3_aligner_wgpu::gpu::DeviceSelector;
+use qwen3_aligner_wgpu::gpu::Backend;
 use qwen3_aligner_wgpu::paths;
 use qwen3_aligner_wgpu::postprocess::AlignItem;
 use qwen3_aligner_wgpu::shaders;
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     }
 
     let device = arg_value(&args, "--device").unwrap_or_else(|| "auto".to_string());
-    let selector = DeviceSelector::parse(&device)?;
+    let backend = Backend::parse(&device)?;
 
     // The 16-bit storage format is fixed before the first pipeline exists, so it
     // is resolved here and handed to the load rather than set afterwards; see
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
     let language = arg_value(&args, "--language");
 
     let t_load = Instant::now();
-    let mut aligner = Aligner::load_with_dtype(selector, &model_dir, half)?;
+    let mut aligner = Aligner::load_backend_with_dtype(backend, &model_dir, half)?;
     eprintln!(
         "device {}  dtype {}  load {:.1}s",
         aligner.describe(),
@@ -179,7 +179,8 @@ USAGE:
 OPTIONS:
   --model <dir>    checkpoint directory; default `QALIGN_MODEL`, else
                    D:\\Qwen3-ASR\\models\\Qwen3-ForcedAligner-0.6B-hf.
-  --device <spec>  auto | cpu | vulkan | dx12 | metal | gl | <adapter substring>
+  --device <spec>  auto (gpu, or cpu when none opens) | cpu | gpu (error if no
+                   gpu opens) | vulkan[:i] | dx12 | metal | gl | #n | <adapter substring>
   --dtype <f16|bf16>
                    storage format for the 16-bit weights and activations.  f16
                    (default) is what reproduces the reference: it has no

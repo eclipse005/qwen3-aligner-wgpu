@@ -238,6 +238,24 @@ impl Aligner {
     }
 
     /// As [`Self::load`], with the 16-bit storage format named explicitly.
+    /// See [`Self::load_backend_with_dtype`].
+    pub fn load_with_dtype(
+        selector: DeviceSelector,
+        model_dir: &Path,
+        half: Half,
+    ) -> Result<Self> {
+        Self::load_backend_with_dtype(crate::gpu::Backend::from_selector(selector), model_dir, half)
+    }
+
+    /// [`crate::gpu::Backend::Auto`] opens the best GPU and uses the CPU towers
+    /// only when that device cannot be created. [`crate::gpu::Backend::Gpu`]
+    /// returns the error. [`crate::gpu::Backend::Cpu`] never touches wgpu.
+    /// Storage format is [`shaders::DEFAULT_HALF`].
+    pub fn load_backend(policy: crate::gpu::Backend, model_dir: &Path) -> Result<Self> {
+        Self::load_backend_with_dtype(policy, model_dir, shaders::DEFAULT_HALF)
+    }
+
+    /// [`Self::load_backend`] with the 16-bit storage format named explicitly.
     ///
     /// The format has to be fixed **before the first pipeline is built** — the
     /// unpacking in a compiled kernel cannot change afterwards — so it is set
@@ -245,8 +263,8 @@ impl Aligner {
     /// host-side conversion in the run then reads the same value
     /// ([`shaders::half`]).  A second call naming a different format panics
     /// inside `set_half` rather than producing two formats in one process.
-    pub fn load_with_dtype(
-        selector: DeviceSelector,
+    pub fn load_backend_with_dtype(
+        policy: crate::gpu::Backend,
         model_dir: &Path,
         half: Half,
     ) -> Result<Self> {
@@ -289,28 +307,34 @@ impl Aligner {
         );
         crate::load_trace::note("rope tables", t);
 
-        let backend = if matches!(selector, DeviceSelector::Cpu) {
-            let mut decoder = crate::cpu_decoder::CpuTextDecoder::load(
-                model_dir,
-                "thinker.model",
-                cfg.text_cfg.clone(),
-                cfg.max_seq,
-                cfg.max_seq,
-            )?;
-            let cos: Vec<f16> = cos.iter().map(|&v| f16::from_f32(v)).collect();
-            let sin: Vec<f16> = sin.iter().map(|&v| f16::from_f32(v)).collect();
-            decoder.set_rope_tables(&cos, &sin);
-            let encoder = crate::audio_encoder::CpuAudioEncoder::load(
-                &weights,
-                "thinker.audio_tower",
-                &cfg.audio_cfg,
-            )?;
-            Backend::Cpu { encoder, decoder }
-        } else {
-            let t = std::time::Instant::now();
-            let gpu = pollster::block_on(Gpu::new_with(selector.clone()))
-                .with_context(|| format!("open device {selector:?}"))?;
-            crate::load_trace::note("adapter + device", t);
+        let t_dev = std::time::Instant::now();
+        let opened = match policy {
+            crate::gpu::Backend::Cpu => None,
+            crate::gpu::Backend::Auto => match pollster::block_on(Gpu::new_with(DeviceSelector::Auto))
+            {
+                Ok(gpu) => Some(gpu),
+                Err(e) => {
+                    eprintln!(
+                        "qwen-aligner: no usable wgpu adapter ({e:#}); using the CPU backend"
+                    );
+                    None
+                }
+            },
+            crate::gpu::Backend::Gpu(selector) => {
+                if matches!(selector, DeviceSelector::Cpu) {
+                    bail!("Backend::Gpu does not take the CPU selector; use Backend::Cpu");
+                }
+                Some(
+                    pollster::block_on(Gpu::new_with(selector.clone()))
+                        .with_context(|| format!("open device {selector:?}"))?,
+                )
+            }
+        };
+        if opened.is_some() {
+            crate::load_trace::note("adapter + device", t_dev);
+        }
+
+        let backend = if let Some(gpu) = opened {
             let t = std::time::Instant::now();
             crate::load_trace::transfer::reset();
             let decoder = WgpuTextDecoder::load(
@@ -338,6 +362,23 @@ impl Aligner {
             crate::load_trace::note("gpu audio tower", t);
             crate::load_trace::transfer::note("gpu audio tower: transfer");
             Backend::Gpu { encoder, decoder }
+        } else {
+            let mut decoder = crate::cpu_decoder::CpuTextDecoder::load(
+                model_dir,
+                "thinker.model",
+                cfg.text_cfg.clone(),
+                cfg.max_seq,
+                cfg.max_seq,
+            )?;
+            let cos: Vec<f16> = cos.iter().map(|&v| f16::from_f32(v)).collect();
+            let sin: Vec<f16> = sin.iter().map(|&v| f16::from_f32(v)).collect();
+            decoder.set_rope_tables(&cos, &sin);
+            let encoder = crate::audio_encoder::CpuAudioEncoder::load(
+                &weights,
+                "thinker.audio_tower",
+                &cfg.audio_cfg,
+            )?;
+            Backend::Cpu { encoder, decoder }
         };
 
         let embed_tokens = weights

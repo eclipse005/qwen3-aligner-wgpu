@@ -70,7 +70,7 @@ align --audio speech.wav --text transcript.txt --language English --output out.j
 | `--language <name>` | 语言，如 `English`、`Chinese`；日语、韩语依赖它选择分词方式 |
 | `--output <json>` | 结果写成 JSON；不填则按 `词<TAB>开始<TAB>结束` 打印 |
 | `--model <dir>` | 模型目录（或环境变量 `QALIGN_MODEL`） |
-| `--device <name>` | 强制指定设备；`cpu` 表示强制 CPU。默认自动挑选最佳设备 |
+| `--device <name>` | `auto`（默认：有显卡用显卡，打不开才用 CPU）、`cpu`、`gpu`（没有显卡或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--dtype <f16\|bf16>` | 16 位权重与激活的存储格式。默认 `f16`——该格式与参考实现的复现结果最接近；按该格式存储的检查点也可选 `bf16` |
 | `--list-devices` | 列出本机可用设备 |
 
@@ -78,9 +78,9 @@ align --audio speech.wav --text transcript.txt --language English --output out.j
 
 ```rust
 use qwen3_aligner_wgpu::align_inference::Aligner;
-use qwen3_aligner_wgpu::gpu::DeviceSelector;
+use qwen3_aligner_wgpu::gpu::Backend;
 
-let mut aligner = Aligner::load(DeviceSelector::parse("auto")?, std::path::Path::new("model"))?;
+let mut aligner = Aligner::load_backend(Backend::parse("auto")?, std::path::Path::new("model"))?;
 let items = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some("English"))?;
 for it in &items {
     println!("{:.3}s - {:.3}s  {}", it.start_time, it.end_time, it.text);
