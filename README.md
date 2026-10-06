@@ -70,7 +70,7 @@ Each result item carries `text`, `start_time` and `end_time` in seconds.
 | `--language <name>` | Language such as `English`, `Chinese`; Japanese and Korean rely on it for tokenization |
 | `--output <json>` | Write results as JSON; without it, results print as `word<TAB>start<TAB>end` |
 | `--model <dir>` | Model directory (or the `QALIGN_MODEL` environment variable) |
-| `--device <name>` | `auto` (default: GPU, or CPU when none opens), `cpu`, `gpu` (error if no GPU opens), or `vulkan[:i]` / `dx12` / a name substring |
+| `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--dtype <f16\|bf16>` | Storage format for 16-bit weights and activations. Defaults to `f16`, which reproduces the reference implementation most closely; `bf16` is accepted for checkpoints stored that way |
 | `--list-devices` | List the devices usable on this machine |
 

@@ -28,8 +28,8 @@ pub struct Gpu {    pub device: wgpu::Device,
 /// backend, or address the same machine's adapters by index.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceSelector {
-    /// The default: the best GPU, on the runtime this engine is tuned for
-    /// (Vulkan first, then Metal, then D3D12, then GL — see [`rank`]).
+    /// The default: discrete, then integrated, then a virtual GPU. CPU adapters
+    /// are skipped. Vulkan is tried before Metal, D3D12, and GL (see [`rank`]).
     #[default]
     Auto,
     /// A compute runtime and which device of it: `Runtime { api: Vulkan, index: 1 }`
@@ -113,10 +113,11 @@ impl DeviceSelector {
 
 /// Which tower to run, separate from which adapter [`DeviceSelector`] names.
 ///
-/// * [`Self::Auto`] — one real GPU, or the CPU towers when none can be opened.
+/// * [`Self::Auto`] — a real GPU, or the CPU towers when none can be opened.
+///   An unpinned selector tries discrete, then integrated, then a virtual GPU.
 /// * [`Self::Cpu`] — the CPU towers. No adapter.
-/// * [`Self::Gpu`] — that adapter, or an error. [`DeviceSelector::Auto`] still
-///   picks the best card; it does not fall back to the host.
+/// * [`Self::Gpu`] — that adapter, or an error. [`DeviceSelector::Auto`] walks
+///   discrete then integrated and does not fall back to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
     Auto,
@@ -219,16 +220,24 @@ async fn adapters_for(selector: &DeviceSelector) -> Vec<wgpu::Adapter> {
     }
 }
 
-/// Default-selection order: discrete before integrated before virtual/CPU, then
-/// by graphics API (Vulkan, Metal, D3D12, GL).
-fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
-    let class = match info.device_type {
+/// Discrete, then integrated, then virtual. A CPU adapter is not a GPU.
+/// The second key of [`rank`] is the graphics API: Vulkan, Metal, D3D12, GL.
+fn device_class(kind: wgpu::DeviceType) -> u8 {
+    match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
         wgpu::DeviceType::Cpu => 3,
         _ => 4,
-    };
+    }
+}
+
+fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
+    device_class(info.device_type) <= 2
+}
+
+fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let class = device_class(info.device_type);
     let api = match info.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -434,13 +443,7 @@ pub fn runtime_name(api: wgpu::Backend) -> &'static str {
 }
 
 fn rank_of(d: &DeviceInfo) -> (u8, u8) {
-    let class = match d.device_type {
-        wgpu::DeviceType::DiscreteGpu => 0,
-        wgpu::DeviceType::IntegratedGpu => 1,
-        wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Cpu => 3,
-        _ => 4,
-    };
+    let class = device_class(d.device_type);
     let api = match d.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -453,8 +456,8 @@ fn rank_of(d: &DeviceInfo) -> (u8, u8) {
 
 impl Gpu {
     /// Enumerate adapters and pick one.  `prefer` matches a case-insensitive
-    /// substring of the adapter name (e.g. `"nvidia"`, `"intel"`); without it the
-    /// first discrete GPU wins, falling back to whatever is available.
+    /// substring of the adapter name (e.g. `"nvidia"`, `"intel"`); without it
+    /// Auto tries discrete, then integrated, then a virtual GPU, and skips CPU adapters.
     ///
     /// Shorthand for [`Gpu::new_with`] with [`DeviceSelector::Name`] / `Auto`.
     pub async fn new(prefer: Option<&str>) -> Result<Self> {
@@ -491,18 +494,21 @@ impl Gpu {
         // ordered best-first (discrete before integrated), so `vulkan:1` is a
         // stable name for "the second GPU Vulkan can see".  `Auto` uses that
         // same ordering across all runtimes.
-        let adapter = match &selector {
-            DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
+        // `Auto` walks every real GPU, discrete before integrated. A named
+        // adapter or a runtime index stays on that one device.
+        let candidates: Vec<&wgpu::Adapter> = match &selector {
+            DeviceSelector::Index(i) => vec![adapters.get(*i).ok_or_else(|| {
                 anyhow::anyhow!(
                     "device #{i} does not exist ({} adapter(s) visible: {})",
                     adapters.len(),
                     list_names(&adapters)
                 )
-            })?,
+            })?],
             sel => {
                 let mut hits: Vec<&wgpu::Adapter> = adapters
                     .iter()
                     .filter(|a| sel.matches(&a.get_info()))
+                    .filter(|a| !matches!(sel, DeviceSelector::Auto) || is_real_gpu(&a.get_info()))
                     .collect();
                 if hits.is_empty() {
                     let hint = if matches!(sel, DeviceSelector::Auto) {
@@ -514,43 +520,64 @@ impl Gpu {
                 }
                 hits.sort_by_key(|a| rank(&a.get_info()));
                 match sel {
-                    DeviceSelector::Runtime { index, .. } => hits.get(*index).copied().ok_or_else(
-                        || {
+                    DeviceSelector::Runtime { index, .. } => {
+                        vec![hits.get(*index).copied().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "that runtime has {} device(s), index {index} is out of range",
                                 hits.len()
                             )
-                        },
-                    )?,
-                    _ => hits[0],
+                        })?]
+                    }
+                    DeviceSelector::Auto => hits,
+                    _ => vec![hits[0]],
                 }
             }
         };
 
-        let info = adapter.get_info();
-        let features = adapter.features();
-        let limits = adapter.limits();
-
         let t = std::time::Instant::now();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("qwen3-aligner-wgpu"),
-                // Timestamp queries gate the per-op step profiler; SUBGROUP lets
-                // `gemv` use warp shuffles instead of shared-memory butterflies.
-                // All three are intersected with what the adapter reports, so an
-                // adapter without them still gets a device.
-                required_features: features
-                    & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
-                        | wgpu::Features::SUBGROUP
-                        | wgpu::Features::PIPELINE_CACHE),
-                required_limits: limits.clone(),
-                ..Default::default()
-            })
-            .await
-            .context("request_device")?;
+        let mut opened = None;
+        let mut skipped: Option<anyhow::Error> = None;
+        for adapter in &candidates {
+            let info = adapter.get_info();
+            let features = adapter.features();
+            let limits = adapter.limits();
+            match adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("qwen3-aligner-wgpu"),
+                    // Timestamp queries gate the per-op step profiler; SUBGROUP lets
+                    // `gemv` use warp shuffles instead of shared-memory butterflies.
+                    // All three are intersected with what the adapter reports, so an
+                    // adapter without them still gets a device.
+                    required_features: features
+                        & (wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                            | wgpu::Features::SUBGROUP
+                            | wgpu::Features::PIPELINE_CACHE),
+                    required_limits: limits.clone(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok((device, queue)) => {
+                    opened = Some((info, features, limits, device, queue));
+                    break;
+                }
+                Err(e) => {
+                    if candidates.len() > 1 {
+                        eprintln!(
+                            "qwen-aligner: skip {} ({:?}, {:?}): {e:#}",
+                            info.name, info.backend, info.device_type
+                        );
+                    }
+                    skipped = Some(e.into());
+                }
+            }
+        }
         crate::load_trace::note("gpu: request_device", t);
+        let Some((info, features, limits, device, queue)) = opened else {
+            return Err(skipped.context("request_device")?);
+        };
 
         // surface async validation errors / device loss instead of dying later
         // at an unrelated map with a bare "async map a buffer"
@@ -906,6 +933,14 @@ impl<'a> BulkUpload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_orders_discrete_before_integrated() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
+        assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
+        assert!(device_class(VirtualGpu) < device_class(Cpu));
+    }
 
     #[test]
     fn backend_policy_is_auto_cpu_or_required_gpu() {

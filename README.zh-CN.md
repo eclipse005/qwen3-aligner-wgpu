@@ -70,7 +70,7 @@ align --audio speech.wav --text transcript.txt --language English --output out.j
 | `--language <name>` | 语言，如 `English`、`Chinese`；日语、韩语依赖它选择分词方式 |
 | `--output <json>` | 结果写成 JSON；不填则按 `词<TAB>开始<TAB>结束` 打印 |
 | `--model <dir>` | 模型目录（或环境变量 `QALIGN_MODEL`） |
-| `--device <name>` | `auto`（默认：有显卡用显卡，打不开才用 CPU）、`cpu`、`gpu`（没有显卡或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
+| `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--dtype <f16\|bf16>` | 16 位权重与激活的存储格式。默认 `f16`——该格式与参考实现的复现结果最接近；按该格式存储的检查点也可选 `bf16` |
 | `--list-devices` | 列出本机可用设备 |
 
