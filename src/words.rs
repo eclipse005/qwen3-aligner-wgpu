@@ -1,25 +1,32 @@
 //! Word splitting — the contract that decides timestamp granularity.
 //!
-//! Per language: Japanese goes through nagisa, Korean splits on whitespace, and
-//! everything else emits one token per CJK character and one per
-//! space-delimited run.
+//! Per language: Japanese goes through nagisa; everything else (including
+//! Korean) uses content-aware units that match CTC-style alignment:
+//!
+//! * **Han / CJK ideographs** → one token per character.
+//! * **Hangul and Latin** → word-level via spaces, with **script-run** breaks
+//!   when Hangul abuts a non-Hangul letter run (and vice versa) with no space.
+//! * **Japanese** is morphological via nagisa (`女子` / `アナ` / `の` / `仕事`),
+//!   so `ja` needs the `ja` feature.
 //!
 //! Three behaviours are load-bearing and none are guessable:
 //!
-//! * **Japanese is not per-character.**  nagisa's morphemes are the units
-//!   (`女子` / `アナ` / `の` / `仕事`), so `ja` needs a morphological analyser and
-//!   the `ja` feature.  Chinese, by contrast, *is* one token per CJK character.
 //! * **Punctuation is dropped, apostrophes are kept**, and a dropped character
 //!   does **not** break the word: `50-minute` becomes the single token
-//!   `50minute`.  Only whitespace and a CJK character end the current word.
+//!   `50minute`.  Only whitespace, a CJK character, or a Hangul↔other letter
+//!   script-run boundary ends the current word.
 //! * **`_clean_tokens` runs on nagisa's output too**, so a morpheme that is pure
 //!   punctuation disappears rather than becoming an empty token.
+//! * **Korean is not a pure whitespace split.**  Spaced Hangul eojeol stay
+//!   whole, but Hanja / Chinese runs never glue into one blob — each ideograph
+//!   is its own token, even under `lang=ko`.
 
 use unicode_general_category::{get_general_category, GeneralCategory};
 
 /// CJK ideographs.  Note `is_kept_char` accepts these a second time: they are
 /// `Lo`, so they would pass on the `L` test alone, but the explicit ranges
-/// matter because they are also what *ends* a Latin run in the default branch.
+/// matter because they are also what *ends* a Latin/Hangul run in the default
+/// branch (char-level emission).
 pub fn is_cjk_char(c: char) -> bool {
     let k = c as u32;
     (0x4E00..=0x9FFF).contains(&k)
@@ -30,6 +37,17 @@ pub fn is_cjk_char(c: char) -> bool {
         || (0x2B820..=0x2CEAF).contains(&k)
         || (0xF900..=0xFAFF).contains(&k)
         || (0x2F800..=0x2FA1F).contains(&k)
+}
+
+/// Hangul jamo + syllables.  Not ideographs: these stay word-level (space /
+/// script-run delimited), unlike Han/CJK which emit per character.
+pub fn is_hangul_char(c: char) -> bool {
+    let k = c as u32;
+    (0x1100..=0x11FF).contains(&k) // Hangul Jamo
+        || (0x3130..=0x318F).contains(&k) // Hangul Compatibility Jamo
+        || (0xA960..=0xA97F).contains(&k) // Hangul Jamo Extended-A
+        || (0xAC00..=0xD7A3).contains(&k) // Hangul Syllables
+        || (0xD7B0..=0xD7FF).contains(&k) // Hangul Jamo Extended-B
 }
 
 /// Characters that survive tokenisation: letters, numbers, apostrophes, CJK.
@@ -99,21 +117,15 @@ pub fn split_words(text: &str, language: Option<&str>) -> Result<Vec<String>, Wo
     Ok(split_default(text))
 }
 
-/// Korean: `_clean_tokens(LTokenizer().tokenize(text))`, with the **default empty
-/// scores**.
+/// Korean: content-aware units (same as [`split_default`]).
 ///
-/// Measured, not assumed: with no score dictionary, soynlp's `LTokenizer` splits
-/// on nothing — every whitespace-delimited run comes back whole
-/// (`안녕하세요 오늘 날씨가 좋네요` -> those same four words).  Giving it the
-/// 17 968-entry `korean_dict_jieba.dict` instead produces `안녕 / 하세요`,
-/// `날씨 / 가`, which is a *different* word list and therefore a different
-/// timestamp granularity.
-///
-/// Note this is deliberately **not** `split_default`: Korean text can carry
-/// hanja, and `clean_token` keeps a CJK character inside its word rather than
-/// emitting it as its own token the way the Chinese path does.
+/// Historically this matched soynlp `LTokenizer()` with empty scores — a pure
+/// whitespace split that kept Hanja inside the eojeol.  That glued long Chinese
+/// runs into one token whenever ASR mixed ko+zh without spaces.  CTC-style
+/// alignment wants Han/CJK at character granularity and Hangul eojeol only when
+/// they are space-delimited (or form a Hangul script run).
 fn split_korean(text: &str) -> Vec<String> {
-    clean_tokens(text.split_whitespace())
+    split_default(text)
 }
 
 #[cfg(feature = "ja")]
@@ -160,21 +172,51 @@ fn split_japanese(_text: &str) -> Result<Vec<String>, WordSplitError> {
     Err(WordSplitError::JapaneseFeatureDisabled)
 }
 
-/// CJK characters individually; space-delimited scripts produce whole words.
+/// Whether `c` is a letter-like kept char that participates in script-run detection.
+/// Numbers and apostrophes attach to the current run without changing its script.
+fn is_script_letter(c: char) -> bool {
+    c != '\''
+        && !matches!(
+            get_general_category(c),
+            GeneralCategory::DecimalNumber
+                | GeneralCategory::LetterNumber
+                | GeneralCategory::OtherNumber
+        )
+}
+
+/// CJK characters individually; Hangul/Latin as space- or script-run-delimited
+/// words.  Hangul↔non-Hangul letter transitions flush even without whitespace so
+/// glued mixed ASR (`hello안녕`, `사람hello`) does not form one blob.
 fn split_default(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut buf = String::new();
+    // `None` while the buffer is empty or holds only digits/apostrophes;
+    // `Some(true)` once a Hangul letter has set the run; `Some(false)` for
+    // any other letter script (Latin, Cyrillic, …).
+    let mut buf_hangul: Option<bool> = None;
+
     for c in text.chars() {
         if is_cjk_char(c) {
             if !buf.is_empty() {
                 tokens.push(std::mem::take(&mut buf));
+                buf_hangul = None;
             }
             tokens.push(c.to_string());
         } else if c.is_whitespace() {
             if !buf.is_empty() {
                 tokens.push(std::mem::take(&mut buf));
+                buf_hangul = None;
             }
         } else if is_kept_char(c) {
+            if is_script_letter(c) {
+                let hangul = is_hangul_char(c);
+                if let Some(prev) = buf_hangul {
+                    if prev != hangul {
+                        tokens.push(std::mem::take(&mut buf));
+                    }
+                }
+                buf_hangul = Some(hangul);
+            }
             buf.push(c);
         }
         // Anything else (punctuation, symbols, marks) is dropped *without*
@@ -192,20 +234,26 @@ mod tests {
 
     #[test]
     fn hyphen_does_not_split_a_word() {
-        assert_eq!(split_words("a 50-minute frame", Some("English")).unwrap(),
-                   vec!["a", "50minute", "frame"]);
+        assert_eq!(
+            split_words("a 50-minute frame", Some("English")).unwrap(),
+            vec!["a", "50minute", "frame"]
+        );
     }
 
     #[test]
     fn apostrophe_is_kept() {
-        assert_eq!(split_words("don't stop", Some("English")).unwrap(),
-                   vec!["don't", "stop"]);
+        assert_eq!(
+            split_words("don't stop", Some("English")).unwrap(),
+            vec!["don't", "stop"]
+        );
     }
 
     #[test]
     fn punctuation_is_dropped_and_does_not_flush() {
-        assert_eq!(split_words("All right, viewers. So", Some("English")).unwrap(),
-                   vec!["All", "right", "viewers", "So"]);
+        assert_eq!(
+            split_words("All right, viewers. So", Some("English")).unwrap(),
+            vec!["All", "right", "viewers", "So"]
+        );
     }
 
     #[test]
@@ -219,8 +267,10 @@ mod tests {
 
     #[test]
     fn latin_run_inside_chinese_is_one_token() {
-        assert_eq!(split_words("用 AI 做", Some("Chinese")).unwrap(),
-                   vec!["用", "AI", "做"]);
+        assert_eq!(
+            split_words("用 AI 做", Some("Chinese")).unwrap(),
+            vec!["用", "AI", "做"]
+        );
     }
 
     #[test]
@@ -232,19 +282,25 @@ mod tests {
     fn combining_marks_are_not_kept() {
         // U+3099 is `Mn` and `Other_Alphabetic`; Python's `category[0] == "L"`
         // is false, so it must not be treated as a letter here either.
-        assert_eq!(split_words("か\u{3099}き", Some("English")).unwrap(), vec!["かき"]);
+        assert_eq!(
+            split_words("か\u{3099}き", Some("English")).unwrap(),
+            vec!["かき"]
+        );
     }
 
     #[cfg(feature = "ja")]
     #[test]
     fn japanese_uses_morphemes_not_characters() {
-        assert_eq!(split_words("女子アナの仕事に耐える。", Some("Japanese")).unwrap(),
-                   vec!["女子", "アナ", "の", "仕事", "に", "耐える"]);
+        assert_eq!(
+            split_words("女子アナの仕事に耐える。", Some("Japanese")).unwrap(),
+            vec!["女子", "アナ", "の", "仕事", "に", "耐える"]
+        );
     }
 
     #[test]
-    fn korean_is_whitespace_split() {
-        // Verified against soynlp's `LTokenizer()` with its default empty scores.
+    fn korean_is_whitespace_split_for_eojeol() {
+        // Spaced Hangul eojeol stay whole (soynlp-empty-scores shape), but the
+        // path is now content-aware — see mixed / Hanja tests below.
         assert_eq!(
             split_words("안녕하세요 오늘 날씨가 좋네요", Some("Korean")).unwrap(),
             vec!["안녕하세요", "오늘", "날씨가", "좋네요"]
@@ -256,9 +312,107 @@ mod tests {
     }
 
     #[test]
-    fn korean_keeps_hanja_inside_its_word() {
-        // The Chinese path would emit 中 and 國 separately; the Korean path must not.
-        assert_eq!(split_words("中國 사람", Some("Korean")).unwrap(), vec!["中國", "사람"]);
+    fn korean_hanja_is_char_level_not_glued() {
+        // Han/CJK must never stay as one blob under lang=ko.
+        assert_eq!(
+            split_words("中國 사람", Some("Korean")).unwrap(),
+            vec!["中", "國", "사람"]
+        );
+        assert_eq!(
+            split_words("中國사람", Some("Korean")).unwrap(),
+            vec!["中", "國", "사람"]
+        );
+    }
+
+    #[test]
+    fn glued_korean_chinese_splits_by_script_runs() {
+        assert_eq!(
+            split_words("안녕하세요你好世界", Some("Korean")).unwrap(),
+            vec!["안녕하세요", "你", "好", "世", "界"]
+        );
+        // Same content under Chinese / default — mixed sharpness is not ko-only.
+        assert_eq!(
+            split_words("안녕하세요你好世界", Some("Chinese")).unwrap(),
+            vec!["안녕하세요", "你", "好", "世", "界"]
+        );
+        assert_eq!(
+            split_words("안녕하세요你好世界", None).unwrap(),
+            vec!["안녕하세요", "你", "好", "世", "界"]
+        );
+    }
+
+    #[test]
+    fn mixed_ko_zh_en_script_runs() {
+        assert_eq!(
+            split_words("사람你好hello世界", Some("Korean")).unwrap(),
+            vec!["사람", "你", "好", "hello", "世", "界"]
+        );
+        assert_eq!(
+            split_words("hello안녕", Some("English")).unwrap(),
+            vec!["hello", "안녕"]
+        );
+        assert_eq!(
+            split_words("안녕hello", Some("Korean")).unwrap(),
+            vec!["안녕", "hello"]
+        );
+        // ISO code aliases
+        assert_eq!(
+            split_words("hello世界ko테스트", Some("ko")).unwrap(),
+            vec!["hello", "世", "界", "ko", "테스트"]
+        );
+    }
+
+    #[test]
+    fn real_asr_raw_mixed_ko_zh_en_snippet() {
+        // Realistic ASR raw: Korean eojeol, then a glued Chinese run with no
+        // spaces, Hangul name abutting the last Han char, then Latin.
+        let asr_raw = "네 맞아요这个就是我们要找的人김민수 씨입니다 hello everyone";
+        let got = split_words(asr_raw, Some("Korean")).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "네",
+                "맞아요",
+                "这",
+                "个",
+                "就",
+                "是",
+                "我",
+                "们",
+                "要",
+                "找",
+                "的",
+                "人",
+                "김민수",
+                "씨입니다",
+                "hello",
+                "everyone",
+            ]
+        );
+        // No token is a multi-character Han run.
+        for t in &got {
+            let han: String = t.chars().filter(|&c| is_cjk_char(c)).collect();
+            assert!(
+                han.chars().count() <= 1,
+                "token {t:?} glued Han run {han:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ko_lang_does_not_disable_mixed_smart_split() {
+        // lang=ko must not fall back to pure whitespace (old split_korean).
+        // 중/국 are Hangul syllables, so unspaced "오늘중국" is one Hangul run;
+        // only 北/京 are char-level ideographs.
+        let glued = "오늘중국北京여행OK";
+        assert_eq!(
+            split_words(glued, Some("Korean")).unwrap(),
+            vec!["오늘중국", "北", "京", "여행", "OK"]
+        );
+        assert_eq!(
+            split_words("오늘中國여행OK", Some("ko")).unwrap(),
+            vec!["오늘", "中", "國", "여행", "OK"]
+        );
     }
 
     /// Probe, not a gate: where the Japanese path's time actually goes.
