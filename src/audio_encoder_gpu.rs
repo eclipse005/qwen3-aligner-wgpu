@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 // f16 and bf16 are the same width and the same packing, so this file's host-side
 // vectors are one type either way: `f16` here is [`crate::half16::H16`], which
@@ -32,7 +32,7 @@ use crate::half16::H16 as f16;
 
 use crate::audio_encoder::feo;
 use crate::config::AudioEncoderConfig;
-use crate::gpu::{BulkUpload, Gpu};
+use crate::gpu::{BulkUpload, Gpu, PipeJob};
 use crate::shaders;
 use crate::weights::{self, PackedWeight, RawTensor};
 
@@ -896,21 +896,43 @@ impl GpuAudioEncoder {
         let gemm_layout = gemm_layout(gpu, "enc_gemm", 3, &[2]);
         // A bias needs a storage binding *after* the dynamic-offset uniform.
         let gemm_bias_layout = gemm_bias_layout(gpu, "enc_gemm_bias", &[2]);
+        let jobs = [
+            PipeJob::new("enc_im2col", shaders::audio_im2col(), "im2col", None),
+            PipeJob::new("enc_gelu", shaders::audio_bias_gelu(), "bias_gelu", None),
+            PipeJob::new("enc_gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_layout)),
+            PipeJob::new("enc_gemm_t", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_layout)),
+            PipeJob::new("enc_extract", shaders::audio_extract_qkv(), "extract", None),
+            PipeJob::new("enc_win_pack", shaders::audio_win_pack(), "win_pack", None),
+            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_layout)),
+            PipeJob::new("enc_gemm_bias", shaders::prefill_gemm_bias(false, false), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_gemm_beta_bias", shaders::prefill_gemm_bias(false, true), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_softmax", shaders::audio_window_softmax(), "softmax", None),
+            PipeJob::new("enc_layernorm", shaders::audio_layernorm(), "layernorm", None),
+            PipeJob::new("enc_permute", shaders::audio_permute_pe(), "permute_pe", None),
+            PipeJob::new("enc_add_pe", shaders::audio_add_pe(), "add_pe", None),
+            PipeJob::new("enc_attn_flat", shaders::audio_attn_flat(), "attn_flat", None),
+        ];
+        let mut built = gpu.pipelines(&jobs)?;
+        let mut take = |name: &str| -> Result<wgpu::ComputePipeline> {
+            built
+                .remove(name)
+                .with_context(|| format!("pipeline {name} was not built"))
+        };
         let p = Pipes {
-            im2col: gpu.pipeline("enc_im2col", &shaders::audio_im2col(), "im2col", None)?,
-            gelu: gpu.pipeline("enc_gelu", &shaders::audio_bias_gelu(), "bias_gelu", None)?,
-            gemm: gpu.pipeline("enc_gemm", &shaders::prefill_gemm(false, false), "gemm", Some(&gemm_layout))?,
-            gemm_t: gpu.pipeline("enc_gemm_t", &shaders::prefill_gemm(true, false), "gemm", Some(&gemm_layout))?,
-            extract: gpu.pipeline("enc_extract", &shaders::audio_extract_qkv(), "extract", None)?,
-            win_pack: gpu.pipeline("enc_win_pack", &shaders::audio_win_pack(), "win_pack", None)?,
-            gemm_beta: gpu.pipeline("enc_gemm_beta", &shaders::prefill_gemm(false, true), "gemm", Some(&gemm_layout))?,
-            gemm_bias: gpu.pipeline("enc_gemm_bias", &shaders::prefill_gemm_bias(false, false), "gemm", Some(&gemm_bias_layout))?,
-            gemm_beta_bias: gpu.pipeline("enc_gemm_beta_bias", &shaders::prefill_gemm_bias(false, true), "gemm", Some(&gemm_bias_layout))?,
-            softmax: gpu.pipeline("enc_softmax", &shaders::audio_window_softmax(), "softmax", None)?,
-            layernorm: gpu.pipeline("enc_layernorm", &shaders::audio_layernorm(), "layernorm", None)?,
-            permute: gpu.pipeline("enc_permute", &shaders::audio_permute_pe(), "permute_pe", None)?,
-            add_pe: gpu.pipeline("enc_add_pe", &shaders::audio_add_pe(), "add_pe", None)?,
-            attn_flat: gpu.pipeline("enc_attn_flat", &shaders::audio_attn_flat(), "attn_flat", None)?,
+            im2col: take("enc_im2col")?,
+            gelu: take("enc_gelu")?,
+            gemm: take("enc_gemm")?,
+            gemm_t: take("enc_gemm_t")?,
+            extract: take("enc_extract")?,
+            win_pack: take("enc_win_pack")?,
+            gemm_beta: take("enc_gemm_beta")?,
+            gemm_bias: take("enc_gemm_bias")?,
+            gemm_beta_bias: take("enc_gemm_beta_bias")?,
+            softmax: take("enc_softmax")?,
+            layernorm: take("enc_layernorm")?,
+            permute: take("enc_permute")?,
+            add_pe: take("enc_add_pe")?,
+            attn_flat: take("enc_attn_flat")?,
         };
 
         // ── conv buffers: one round's worth, allocated once ──
