@@ -28,7 +28,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::gpu::{BulkUpload, Gpu};
+use crate::gpu::{BulkUpload, Gpu, PipeJob};
 use crate::half16::H16;
 use crate::shaders;
 use crate::weights::{self, PackedWeight};
@@ -511,43 +511,46 @@ impl WgpuTextDecoder {
 
         // ── pipelines ─────────────────────────────────────────────────────
         let rms_bs = rms_bs(hs) as usize;
+        // 三个 slab 布局提出来：作业表要活得比生成它的表达式久。
+        let slab_stats_pl =
+            family_layout_dyn(&gpu, "slab_stats", &[(0, true), (1, false)], 2, true);
+        let slab_weights_pl = family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2);
+        let slab_merge_pl =
+            family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3);
+        let jobs = [
+            PipeJob::new("rms_norm", shaders::rms_norm(hs, rms_bs), "rms_norm", None),
+            PipeJob::new("qkv_extract", shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None),
+            PipeJob::new("silu30", shaders::silu_mul_split(inter), "silu_mul_split", None),
+            PipeJob::new("gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_acc", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_causal", shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av_causal", shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("slab_stats", shaders::slab_stats(SLAB_BS, SLAB_T), "slab_stats", Some(&slab_stats_pl)),
+            PipeJob::new("slab_weights", shaders::slab_weights(256), "slab_weights", Some(&slab_weights_pl)),
+            PipeJob::new("slab_merge", shaders::slab_merge(nqh, hd), "slab_merge", Some(&slab_merge_pl)),
+            PipeJob::new("widen_dump", shaders::widen_h16_f32(), "widen", Some(&wd_pl)),
+        ];
+        let mut built = gpu.pipelines(&jobs)?;
+        let mut take = |name: &str| -> Result<wgpu::ComputePipeline> {
+            built
+                .remove(name)
+                .with_context(|| format!("pipeline {name} was not built"))
+        };
         let pipes = Pipes {
-            rms_norm: build("rms_norm", &shaders::rms_norm(hs, rms_bs), "rms_norm", None)?,
-            extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
-            silu: build("silu30", &shaders::silu_mul_split(inter), "silu_mul_split", None)?,
-            gemm: build("gemm", &shaders::prefill_gemm(false, false), "gemm", Some(&gemm_pl))?,
-            gemm_acc: build("gemm_acc", &shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl))?,
-            gemm_av: build("gemm_av", &shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl))?,
-            gemm_causal: build("gemm_causal", &shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl))?,
-            gemm_av_causal: build("gemm_av_causal", &shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl))?,
-            softmax: std::collections::HashMap::from([
-                (32, build("softmax32", &shaders::softmax_causal(32, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-                (64, build("softmax64", &shaders::softmax_causal(64, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-                (128, build("softmax128", &shaders::softmax_causal(128, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-                (256, build("softmax256", &shaders::softmax_causal(256, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-                (512, build("softmax512", &shaders::softmax_causal(512, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-                (1024, build("softmax1024", &shaders::softmax_causal(1024, gpu.subgroup32()), "softmax", Some(&sm_pl))?),
-            ]),
-            repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
-            slab_stats: build(
-                "slab_stats",
-                &shaders::slab_stats(SLAB_BS, SLAB_T),
-                "slab_stats",
-                Some(&family_layout_dyn(&gpu, "slab_stats", &[(0, true), (1, false)], 2, true)),
-            )?,
-            slab_weights: build(
-                "slab_weights",
-                &shaders::slab_weights(256),
-                "slab_weights",
-                Some(&family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2)),
-            )?,
-            slab_merge: build(
-                "slab_merge",
-                &shaders::slab_merge(nqh, hd),
-                "slab_merge",
-                Some(&family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3)),
-            )?,
-            widen: build("widen_dump", &shaders::widen_h16_f32(), "widen", Some(&wd_pl))?,
+            rms_norm: take("rms_norm")?,
+            extract: take("qkv_extract")?,
+            silu: take("silu30")?,
+            gemm: take("gemm")?,
+            gemm_acc: take("gemm_acc")?,
+            gemm_av: take("gemm_av")?,
+            gemm_causal: take("gemm_causal")?,
+            gemm_av_causal: take("gemm_av_causal")?,
+            softmax: std::collections::HashMap::from([ (32, build("softmax32", &shaders::softmax_causal(32, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (64, build("softmax64", &shaders::softmax_causal(64, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (128, build("softmax128", &shaders::softmax_causal(128, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (256, build("softmax256", &shaders::softmax_causal(256, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (512, build("softmax512", &shaders::softmax_causal(512, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (1024, build("softmax1024", &shaders::softmax_causal(1024, gpu.subgroup32()), "softmax", Some(&sm_pl))?), ]), repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
+            slab_stats: take("slab_stats")?,
+            slab_weights: take("slab_weights")?,
+            slab_merge: take("slab_merge")?,
+            widen: take("widen_dump")?,
         };
 
         // ── scratch ───────────────────────────────────────────────────────
