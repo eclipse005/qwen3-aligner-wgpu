@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 
 /// The Qwen3-ForcedAligner checkpoint.
 ///
-/// Override with `QALIGN_MODEL`.  The checkpoint is the **`-hf`** one
+/// Override with `QALIGN_MODEL`.  Either layout loads: the **`-hf`** export
 /// (`architectures = Qwen3ASRForTokenClassification`, tensors under
-/// `model.audio_tower.*` / `model.language_model.*` / `score.weight`); the
-/// original-layout repository stores different tensor names and will not load.
+/// `model.audio_tower.*` / `model.language_model.*` / `score.weight`) and the
+/// original one (`thinker.audio_tower.*` / `thinker.model.*` /
+/// `thinker.lm_head.weight`).  A checkpoint that ships `<dir>/local_head/` gets
+/// the 10 ms refinement; see [`crate::local_head`].
 pub fn model_dir() -> PathBuf {
     env_path("QALIGN_MODEL")
         .unwrap_or_else(|| PathBuf::from(r"D:\Qwen3-ASR\models\Qwen3-ForcedAligner-0.6B-hf"))

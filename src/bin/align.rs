@@ -43,8 +43,8 @@ fn main() -> Result<()> {
     if !model_dir.join("config.json").is_file() {
         bail!(
             "{} does not look like a checkpoint: no config.json in it\n  \
-             expected the `-hf` one (architectures = Qwen3ASRForTokenClassification, \
-             model.audio_tower.* / model.language_model.* / score.weight)",
+             expected either layout: `-hf` (model.audio_tower.* / score.weight) or \
+             the original one (thinker.audio_tower.* / thinker.lm_head.weight)",
             model_dir.display()
         );
     }
@@ -84,13 +84,25 @@ fn main() -> Result<()> {
 
     let language = arg_value(&args, "--language");
 
+    let local_head = arg_value(&args, "--local-head").unwrap_or_else(|| "auto".to_string());
+
     let t_load = Instant::now();
     let mut aligner = Aligner::load_backend_with_dtype(backend, &model_dir, half)?;
+    match local_head.as_str() {
+        "auto" => {}
+        "on" => aligner.set_local_head_enabled(true)?,
+        "off" => aligner.set_local_head_enabled(false)?,
+        other => bail!("--local-head {other}: expected auto, on or off"),
+    }
     eprintln!(
-        "device {}  dtype {}  load {:.1}s",
+        "device {}  dtype {}  load {:.1}s  local_head {}",
         aligner.describe(),
         aligner.half().name(),
-        t_load.elapsed().as_secs_f64()
+        t_load.elapsed().as_secs_f64(),
+        match (aligner.local_head_enabled(), aligner.local_head()) {
+            (true, Some(h)) => h.describe(),
+            _ => "off".to_string(),
+        }
     );
 
     let t0 = Instant::now();
@@ -135,7 +147,7 @@ fn main() -> Result<()> {
     let tm = aligner.timings;
     eprintln!(
         "{} items in {:.3}s  (wav {:.1} / mel {:.1} / words {:.1} / build {:.1} / enc {:.1} / \
-         gather {:.1} / prefill {:.1} / head {:.1} / post {:.1} ms)",
+         gather {:.1} / prefill {:.1} / head {:.1} / post {:.1} / local {:.1} ms)",
         items.len(),
         elapsed,
         tm.wav_ms,
@@ -147,6 +159,7 @@ fn main() -> Result<()> {
         tm.prefill_ms,
         tm.head_ms,
         tm.post_ms,
+        tm.local_ms,
     );
     Ok(())
 }
@@ -189,4 +202,9 @@ OPTIONS:
                    measured to diverge further, not closer.  See docs/perf.md.
   --raw <json>     also write the pre-repair millisecond stream (the model's own
                    argmax, before `fix_timestamps` touches it)
+  --local-head <auto|on|off>
+                   run the Local Head that ships next to the checkpoint
+                   (`<model>/local_head/`), refining each boundary to 10 ms.
+                   `auto` (default) runs it when present, `on` errors without
+                   it, `off` stays on the 80 ms class grid.
 ";

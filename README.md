@@ -19,6 +19,7 @@ The goal is simple: given audio **and** its transcript, produce the start and en
 * ⏱️ Word-level start / end timestamps
 * 🗣️ 11 languages
 * 🇯🇵 Japanese word segmentation built in
+* 🎯 Optional Local Head: 10 ms boundaries instead of the 80 ms grid
 * 🧩 CLI + Rust library
 
 ### Install
@@ -72,6 +73,7 @@ Each result item carries `text`, `start_time` and `end_time` in seconds.
 | `--model <dir>` | Model directory (or the `QALIGN_MODEL` environment variable) |
 | `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--dtype <f16\|bf16>` | Storage format for 16-bit weights and activations. Defaults to `f16`, which reproduces the reference implementation most closely; `bf16` is accepted for checkpoints stored that way |
+| `--local-head <auto\|on\|off>` | Run the Local Head shipped next to the checkpoint (`<model>/local_head/`), refining every boundary to 10 ms. `auto` (default) runs it when present |
 | `--list-devices` | List the devices usable on this machine |
 
 ### Library
@@ -87,7 +89,7 @@ for it in &items {
 }
 ```
 
-`AlignItem` carries `text`, `start_time` and `end_time` (seconds). `align` takes `&mut self` — one instance performs one alignment at a time. Also available: `align_samples` for in-memory 16 kHz mono audio, `align_with_raw` for the pre-fix raw timestamps, `load_with_dtype` to select the 16-bit storage format, and `split_words` / `decode_timestamps` / `fix_timestamps` for pipeline-level control. See `cargo doc` for the full API.
+`AlignItem` carries `text`, `start_time` and `end_time` (seconds). `align` takes `&mut self` — one instance performs one alignment at a time. Also available: `align_samples` for in-memory 16 kHz mono audio, `align_with_raw` for the pre-fix raw timestamps, `load_with_dtype` to select the 16-bit storage format, `set_local_head_enabled` / `local_head` / `local_head_enabled` for the refinement stage, and `split_words` / `decode_timestamps` / `fix_timestamps` for pipeline-level control. See `cargo doc` for the full API.
 
 ### Audio input
 
@@ -109,6 +111,40 @@ The timestamp granularity equals the tokenization granularity, which differs by 
 | Korean | one token per space-separated chunk |
 | Chinese | one token per character |
 | Other languages / mixed | whitespace-separated; punctuation is dropped but words are not split (`50-minute` becomes `50minute`) |
+
+### Local Head
+
+Checkpoints such as `17slever17/Qwen3-ForcedAligner-Ultra` ship a small second
+model in `<model>/local_head/`. It does not change what the Qwen head chooses —
+it refines each chosen endpoint inside a bounded ±60 ms neighbourhood, from
+
+* the final-norm hidden rows at the word's two `<timestamp>` slots (the word's
+  own mean and its neighbours' means ride along as context), and
+* a 41×91 acoustic window centred on the coarse endpoint (±200 ms, 10 ms hop):
+  80 log-mels, log-RMS, its delta, spectral flux and 8 spectral-distance bands.
+
+It is 405k parameters, runs on the CPU (≈20 ms for a 39-word clip on this
+machine) and turns the 80 ms class grid into continuous times.  `--local-head
+auto` (the default) enables it when the directory is there; `off` stays on the
+grid; `on` refuses to run without it.  It is loaded and validated at startup
+(contract literals, tensor shapes, the 91-value normalizer, the canonical
+prior), so a mismatched package fails the load instead of producing
+plausible-looking offsets.
+
+```bash
+align --audio speech.wav --text transcript.txt --language English --local-head on
+```
+
+The port is a transcription of the reference implementation
+(`qwen_fa_ultra`) and is checked against frozen intermediates under
+`tools/gold/local_head/`: features to `1.5e-5`, head offsets and the full
+refined interval to `0.0 ms` on the same inputs.  End to end against the python
+reference on 471 Buckeye utterances the endpoint difference is p50 `0.06 ms` /
+p90 `0.34 ms`; the tail is the coarse argmax ties `docs/perf.md` already
+documents, not the head.  What is left of the ordinary difference is the towers'
+f16-vs-bf16 gap — the head reads hidden rows directly, so it uses the
+reference's own RMSNorm form (unweighted variance), which is *not* the folded
+form the coarse path uses.
 
 ### Why wgpu?
 

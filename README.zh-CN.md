@@ -19,6 +19,7 @@
 * ⏱️ 词级起止时间戳
 * 🗣️ 支持 11 种语言
 * 🇯🇵 内置日语分词
+* 🎯 可选 Local Head：把 80 ms 栅格细化为 10 ms
 * 🧩 CLI + Rust 库
 
 ### 安装
@@ -72,6 +73,7 @@ align --audio speech.wav --text transcript.txt --language English --output out.j
 | `--model <dir>` | 模型目录（或环境变量 `QALIGN_MODEL`） |
 | `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--dtype <f16\|bf16>` | 16 位权重与激活的存储格式。默认 `f16`——该格式与参考实现的复现结果最接近；按该格式存储的检查点也可选 `bf16` |
+| `--local-head <auto\|on\|off>` | 运行检查点自带的 Local Head（`<model>/local_head/`），把每个边界细化到 10 ms。默认 `auto`：有就跑 |
 | `--list-devices` | 列出本机可用设备 |
 
 ### 作为库使用
@@ -109,6 +111,29 @@ ffmpeg -i input.flac -ar 16000 -ac 1 -c:a pcm_f32le output.wav
 | 韩语 | 按空格切，一整段算一个 |
 | 中文 | 每个汉字算一个 |
 | 其他语言 / 混合 | 按空格切；标点会被丢弃但不拆词（`50-minute` 切为 `50minute`） |
+
+### Local Head
+
+`17slever17/Qwen3-ForcedAligner-Ultra` 这类检查点在 `<model>/local_head/` 里附带一个小模型。
+它不改变 Qwen 头选中的目标，只在**±60 ms** 的有界邻域内细化每个端点，输入是
+
+* 该词两个 `<timestamp>` 位置上的 final-norm 隐状态（连同该词均值、前后词均值共四行），以及
+* 以粗端点为心的 41×91 声学窗（±200 ms、10 ms 帧移）：80 维 log-mel、log-RMS 及其差分、
+  频谱通量、8 维谱距。
+
+405k 参数，跑在 CPU 上（本机 39 词的整句约 20 ms），把 80 ms 的类别栅格变成连续时间。
+`--local-head auto`（默认）在有该目录时启用，`off` 留在栅格上，`on` 没有就报错。加载时会校验
+契约常量、张量形状、91 维归一化器和规范先验，包不匹配就在加载阶段失败，而不是输出看似合理的错值。
+
+```bash
+align --audio speech.wav --text transcript.txt --language English --local-head on
+```
+
+该移植是参考实现（`qwen_fa_ultra`）的逐式转写，并与 `tools/gold/local_head/` 下冻结的中间量对拍：
+特征 `1.5e-5`、head offset 与整段细化区间 `0.0 ms`。471 句 Buckeye 端到端对拍，
+端点差 p50 `0.06 ms` / p90 `0.34 ms`；长尾来自 `docs/perf.md` 已记录的粗对齐 argmax
+并列，与 head 无关。常规差异剩下的是两个塔 f16/bf16 的差——因为 head 直接读隐状态，
+它用的是参考实现的 RMSNorm 形式（不加权方差），而非粗路径里那个把权重折进方差的等价形式。
 
 ### 为什么选择 wgpu？
 

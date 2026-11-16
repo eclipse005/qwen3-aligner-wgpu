@@ -201,7 +201,25 @@ pub struct Aligner {
     score: CpuWeight,
     final_norm: Vec<f32>,
     cfg: AlignerConfig,
+    /// The optional `±60 ms` refinement shipped next to the checkpoint
+    /// (`<model>/local_head/`).  `None` when the checkpoint has none.
+    local_head: Option<crate::local_head::LocalHead>,
+    /// Whether [`Self::align`] runs it.  Defaults to `local_head.is_some()`.
+    local_head_on: bool,
     pub timings: Timings,
+}
+
+/// The timestamp head's operands, as [`Aligner::align_raw_rows`] leaves them.
+struct HeadRows {
+    /// One bucket per timestamp token, before `fix_timestamps`.
+    raw_ms: Vec<i64>,
+    /// `[2 * words, num_labels]`, row-major.
+    logits: Vec<f32>,
+    /// `[2 * words, hidden]`: the final-norm rows at the timestamp slots, in
+    /// slot order, in the reference's own normalisation — the Local Head's
+    /// context input.
+    normed: Vec<f32>,
+    hidden_size: usize,
 }
 
 /// One row per phase, so no time falls between the buckets.
@@ -226,6 +244,9 @@ pub struct Timings {
     pub head_ms: f64,
     /// `decode_timestamps`: repair the raw buckets and pair them with the words.
     pub post_ms: f64,
+    /// The Local Head's whole refinement (masked coarse stream, 91-channel
+    /// windows, the head, the interval repair).  Zero when it does not run.
+    pub local_ms: f64,
     pub total_ms: f64,
 }
 
@@ -412,6 +433,12 @@ impl Aligner {
             .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))??;
         crate::load_trace::note("input builder join (tokenizer)", t);
 
+        let t = std::time::Instant::now();
+        let local_head = crate::local_head::LocalHead::load(model_dir)?;
+        if local_head.is_some() {
+            crate::load_trace::note("local head", t);
+        }
+
         Ok(Self {
             backend,
             input_builder,
@@ -419,6 +446,8 @@ impl Aligner {
             score,
             final_norm,
             cfg,
+            local_head_on: local_head.is_some(),
+            local_head,
             timings: Timings::default(),
         })
     }
@@ -483,6 +512,12 @@ impl Aligner {
 
     /// As [`Self::align_with_raw`], for audio the caller already decoded:
     /// mono 16 kHz, in [-1, 1].
+    ///
+    /// When the checkpoint ships a Local Head and it is enabled, the per-word
+    /// timestamps come from [`crate::local_head::LocalHead::refine`] instead of
+    /// the 80 ms class grid; the returned `raw_ms` is still the unrepaired
+    /// coarse stream, so a caller comparing against the reference can always
+    /// read what the head started from.
     pub fn align_samples(
         &mut self,
         samples: &[f32],
@@ -507,11 +542,54 @@ impl Aligner {
         let t = std::time::Instant::now();
         let input = self.input_builder.build(&words, valid)?;
         self.timings.build_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let raw_ms = self.align_raw_ms(&mel, valid, &input)?;
+        let rows = self.align_raw_rows(&mel, valid, &input)?;
+
+        let raw_ms = rows.raw_ms;
         let t = std::time::Instant::now();
-        let items = crate::postprocess::decode_timestamps(&words, &raw_ms)?;
-        self.timings.post_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let items = match (self.local_head_on, self.local_head.as_ref()) {
+            (true, Some(head)) => head.refine(
+                samples,
+                &words,
+                &rows.logits,
+                self.cfg.num_labels,
+                &rows.normed,
+                rows.hidden_size,
+            )?,
+            (true, None) => bail!("the Local Head is enabled but this checkpoint ships none"),
+            (false, _) => crate::postprocess::decode_timestamps(&words, &raw_ms)?,
+        };
+        if self.local_head_on && self.local_head.is_some() {
+            self.timings.local_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.timings.post_ms = 0.0;
+        } else {
+            self.timings.post_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.timings.local_ms = 0.0;
+        }
         Ok((raw_ms, items))
+    }
+
+    /// The Local Head this checkpoint ships, if any.
+    pub fn local_head(&self) -> Option<&crate::local_head::LocalHead> {
+        self.local_head.as_ref()
+    }
+
+    /// Whether [`Self::align`] runs the Local Head.
+    pub fn local_head_enabled(&self) -> bool {
+        self.local_head_on && self.local_head.is_some()
+    }
+
+    /// Turn the Local Head on or off.  Enabling it on a checkpoint that ships
+    /// none is an error rather than a silent fallback: the caller asked for
+    /// 10 ms refinement and would otherwise get the 80 ms grid unaware.
+    pub fn set_local_head_enabled(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            anyhow::ensure!(
+                self.local_head.is_some(),
+                "this checkpoint has no local_head/ package"
+            );
+        }
+        self.local_head_on = enabled;
+        Ok(())
     }
 
     /// The languages the forced aligner supports — the same set as
@@ -566,6 +644,21 @@ impl Aligner {
     /// takes the mel and the assembled input sequence rather than a file, and
     /// returns the pre-repair milliseconds.
     pub fn align_raw_ms(&mut self, mel: &[f32], valid_frames: usize, input: &AlignerInput) -> Result<Vec<i64>> {
+        Ok(self.align_raw_rows(mel, valid_frames, input)?.raw_ms)
+    }
+
+    /// [`Self::align_raw_ms`], keeping the timestamp head's operands.
+    ///
+    /// The Local Head needs two things that would otherwise be dropped here: the
+    /// pre-argmax logits (it masks the classes past the audio's end itself) and
+    /// the final-norm rows at the timestamp slots (its context vector).  Both
+    /// are already computed for the coarse path, so this costs nothing.
+    fn align_raw_rows(
+        &mut self,
+        mel: &[f32],
+        valid_frames: usize,
+        input: &AlignerInput,
+    ) -> Result<HeadRows> {
         let t_all = std::time::Instant::now();
         let hs = self.cfg.text_cfg.hidden_size;
         let seq = input.seq_len();
@@ -643,6 +736,33 @@ impl Aligner {
         // GEMM accumulation order, which is not obtainable.
         let t = std::time::Instant::now();
         let rows: Vec<usize> = input.timestamp_positions.clone();
+        // The Local Head reads these same rows directly, and a per-row positive
+        // scale is *not* invariant inside its LayerNorm/attention — so it gets
+        // the reference's own norm: unweighted variance, exactly what
+        // `Qwen3RMSNorm` computes.  This matters: with the folded form below the
+        // head's offsets move by ~2 ms mean / 5 ms p90 against the reference;
+        // with this one they move by ~0.6 ms, which is what is left of the
+        // towers' f16-vs-bf16 difference.  (Rounding the row to bf16 like the
+        // reference does was measured to change nothing further.)  The folded
+        // form stays untouched for the coarse path, which is the validated one.
+        let head_rows: Vec<f32> = if self.local_head_on && self.local_head.is_some() {
+            rows.par_iter()
+                .flat_map_iter(|&r| {
+                    let row = &h[r * hs..(r + 1) * hs];
+                    let mut acc = 0.0f32;
+                    for x in row {
+                        acc += x * x;
+                    }
+                    let inv = 1.0 / (acc / hs as f32 + self.cfg.text_cfg.rms_norm_eps).sqrt();
+                    row.iter()
+                        .zip(&self.final_norm)
+                        .map(|(x, w)| x * inv * w)
+                        .collect::<Vec<f32>>()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let normed: Vec<f32> = rows
             .par_iter()
             .flat_map_iter(|&r| {
@@ -705,7 +825,12 @@ impl Aligner {
         }
         self.timings.head_ms = t.elapsed().as_secs_f64() * 1000.0;
         self.timings.total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
-        Ok(raw_ms)
+        Ok(HeadRows {
+            raw_ms,
+            logits: logits.data,
+            normed: head_rows,
+            hidden_size: hs,
+        })
     }
 }
 

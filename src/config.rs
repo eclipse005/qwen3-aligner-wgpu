@@ -39,6 +39,11 @@ pub struct ThinkerConfig {
     pub audio_end_token_id: i64,
     #[serde(default = "default_audio_token_id")]
     pub audio_token_id: i64,
+    /// The timestamp head's width, which the original-layout config records
+    /// here (`classify_num`) instead of in a top-level `id2label`.  The `-hf`
+    /// conversion moved it to `id2label`; both are read.
+    #[serde(default)]
+    pub classify_num: Option<usize>,
 }
 
 fn default_audio_start_token_id() -> i64 { 151669 }
@@ -185,12 +190,6 @@ impl AsrConfig {
 
     fn from_json_str(content: &str) -> anyhow::Result<Self> {
         let raw: AsrConfigFile = serde_json::from_str(content)?;
-        let align = raw.timestamp_token_id.map(|timestamp_token_id| AlignHeadConfig {
-            timestamp_token_id,
-            timestamp_segment_time_ms: raw.timestamp_segment_time.unwrap_or(80.0),
-            num_labels: raw.id2label.as_ref().map(|m| m.len()).unwrap_or(0),
-            token_classification_bias: raw.token_classification_bias.unwrap_or(false),
-        });
         let mut thinker = if let Some(tc) = raw.thinker_config {
             tc
         } else {
@@ -206,6 +205,7 @@ impl AsrConfig {
                 audio_start_token_id: raw.audio_start_token_id.unwrap_or_else(default_audio_start_token_id),
                 audio_end_token_id: raw.audio_end_token_id.unwrap_or_else(default_audio_end_token_id),
                 audio_token_id: raw.audio_token_id.unwrap_or_else(default_audio_token_id),
+                classify_num: None,
             }
         };
         if let Some(rp) = thinker.text_config.rope_parameters.as_ref() {
@@ -213,6 +213,20 @@ impl AsrConfig {
                 thinker.text_config.rope_theta = theta;
             }
         }
+        // `-hf` records the head width as an `id2label` map; the original
+        // layout records it as `thinker_config.classify_num`.
+        let num_labels = raw
+            .id2label
+            .as_ref()
+            .map(|m| m.len())
+            .or(thinker.classify_num)
+            .unwrap_or(0);
+        let align = raw.timestamp_token_id.map(|timestamp_token_id| AlignHeadConfig {
+            timestamp_token_id,
+            timestamp_segment_time_ms: raw.timestamp_segment_time.unwrap_or(80.0),
+            num_labels,
+            token_classification_bias: raw.token_classification_bias.unwrap_or(false),
+        });
         Ok(AsrConfig {
             thinker_config: thinker,
             align,

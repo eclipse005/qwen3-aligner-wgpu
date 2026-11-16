@@ -241,12 +241,19 @@ fn remap_hf_weight_name(name: &str) -> String {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         return format!("thinker.model.{rest}");
     }
+    // The original checkpoint names the timestamp head `thinker.lm_head`; the
+    // `-hf` conversion calls it `score`.  Both layouts are loadable.
+    if let Some(rest) = name.strip_prefix("thinker.lm_head.") {
+        return format!("score.{rest}");
+    }
     name.to_string()
 }
 
 fn normalize_hf_weight_names(weights: HashMap<String, RawTensor>) -> HashMap<String, RawTensor> {
     let is_hf = weights.keys().any(|k| {
-        k.starts_with("model.audio_tower.") || k.starts_with("model.language_model.")
+        k.starts_with("model.audio_tower.")
+            || k.starts_with("model.language_model.")
+            || k.starts_with("thinker.lm_head.")
     });
     if !is_hf {
         return weights;

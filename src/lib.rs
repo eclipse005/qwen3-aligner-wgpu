@@ -24,8 +24,11 @@
 //! and checkpoint access; [`shaders`], [`decoder`] and the two audio encoders
 //! are the model's two towers.
 //!
-//! Runs against the **`-hf`** checkpoint (`model.audio_tower.*` /
-//! `score.weight`); the original-layout one stores different tensor names.
+//! Runs against either checkpoint layout — the **`-hf`** export
+//! (`model.audio_tower.*` / `score.weight`) or the original one
+//! (`thinker.audio_tower.*` / `thinker.lm_head.weight`).  When the checkpoint
+//! ships a `<model>/local_head/`, [`local_head`] refines every boundary from the
+//! 80 ms class grid to 10 ms.
 //! Baselines are in `tools/gold/`; `src/gold.rs` records why the timestamp
 //! criterion is a margin rather than a tolerance.
 
@@ -40,6 +43,7 @@ pub mod decoder;
 pub mod gpu;
 pub mod half16;
 pub mod load_trace;
+pub mod local_head;
 pub mod mel;
 pub mod mrope;
 pub mod paths;
