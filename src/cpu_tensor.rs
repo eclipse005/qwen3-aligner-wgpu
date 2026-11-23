@@ -82,6 +82,28 @@ fn linear_gemv(x: &[f32], w: &CpuWeight) -> Vec<f32> {
 fn gemm_row_major(out: &mut [f32], x: &[f32], w: &CpuWeight, m: usize, beta: f32) {
     let n = w.rows;
     let k = w.cols;
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        if m >= 16 {
+            unsafe {
+                crate::cblas::sgemm_rm(
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    x.as_ptr(),
+                    k,
+                    true,
+                    w.data.as_ptr(),
+                    k,
+                    beta,
+                    out.as_mut_ptr(),
+                    n,
+                );
+            }
+            return;
+        }
+    }
     unsafe {
         gemm(
             m,

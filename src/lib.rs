@@ -57,6 +57,9 @@ pub mod words;
 pub mod mel_optimized;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod cblas;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod audio_encoder_accelerate;
 
 pub mod performance_monitor;
