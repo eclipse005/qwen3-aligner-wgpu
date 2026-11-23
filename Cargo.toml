@@ -40,16 +40,29 @@ serde_json = "1"
 tokenizers = { version = "0.22", features = ["onig"] }
 hound = "3"
 rustfft = "6"
-gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
 unicode-general-category = "1.1.0"
 nagisa_rs = { git = "https://github.com/eclipse005/nagisa-rs.git", rev = "cd7726e78ede8451c72cc0fabfd55d2c4ed62442", optional = true }
 thiserror = "2.0.20"
+lazy_static = "1.4"
+gemm = "0.18"
 
 [build-dependencies]
 cmake = "0.1"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "mel_benchmark"
+harness = false
+
 [profile.release]
 debug = false
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
 

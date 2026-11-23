@@ -1,0 +1,16 @@
+# Apple Silicon (M1/M2/M3) 特定优化配置
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+neon,+fp-armv8,+crypto,+aes,+sha2",
+    "-C", "opt-level=3",
+]
+
+[build]
+# 使用所有可用 CPU 核心进行并行编译
+jobs = 8
+
+[profile.release]
+# 额外的 release 优化
+incremental = false

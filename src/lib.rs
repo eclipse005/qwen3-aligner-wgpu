@@ -52,6 +52,15 @@ pub mod shaders;
 pub mod weights;
 pub mod words;
 
+// Apple Silicon optimizations
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod mel_optimized;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod audio_encoder_accelerate;
+
+pub mod performance_monitor;
+
 pub use gpu::{list_devices, Backend, DeviceInfo, DeviceSelector, Gpu};
 pub use mel::load_audio_wav;
 pub use postprocess::{decode_timestamps, fix_timestamps, AlignItem};
