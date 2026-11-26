@@ -90,6 +90,12 @@ pub struct LocalHead {
     hann: Vec<f32>,
     /// `[80][257]` mel bank, normalized per row like the reference.
     bank: Vec<f32>,
+    /// Per-mel active `[start_bin, end_bin]`; outside this range the bank is
+    /// exactly zero, so summing only this slice is bit-identical to the full
+    /// 257-bin loop in Python.
+    mel_ranges: Vec<(usize, usize)>,
+    /// In-place scratch length required by the planned FFT.
+    fft_scratch_len: usize,
 }
 
 impl std::fmt::Debug for LocalHead {
@@ -150,13 +156,19 @@ impl LocalHead {
         );
 
         let mut planner = rustfft::FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(N_FFT);
+        let fft_scratch_len = fft.get_inplace_scratch_len();
+        let bank = mel_filterbank();
+        let mel_ranges = mel_active_ranges(&bank);
         Ok(Some(Self {
             weights,
             mean: normalizer.mean,
             std: normalizer.std,
-            fft: planner.plan_fft_forward(N_FFT),
+            fft,
             hann: hann_window(FRAME_MS * SAMPLE_RATE / 1000),
-            bank: mel_filterbank(),
+            bank,
+            mel_ranges,
+            fft_scratch_len,
         }))
     }
 
@@ -205,6 +217,10 @@ impl LocalHead {
         ensure!(!samples.is_empty(), "local head needs non-empty audio");
         ensure!(n_labels > 0, "timestamp head has no classes");
 
+        if word_count == 0 {
+            return Ok(Vec::new());
+        }
+
         let duration_ms = samples.len() as f64 * 1000.0 / SAMPLE_RATE as f64;
         let valid_classes = valid_class_count(duration_ms, n_labels);
 
@@ -217,23 +233,12 @@ impl LocalHead {
             .collect();
         let fixed_ms = fix_timestamps(&raw_ms);
 
-        // 2. context rows, four per endpoint
-        let (context, masks) = self.context_rows(hidden, hidden_size, word_count);
-
-        // 3. the 91-channel window centred on each fixed endpoint
+        // 2. the 91-channel window centred on each fixed endpoint
         let features = self.features(samples, &fixed_ms);
 
-        // 4. per-endpoint offsets — independent, so plain data parallelism
-        let offsets: Vec<f32> = (0..slots)
-            .into_par_iter()
-            .map(|endpoint| {
-                let feat = &features
-                    [endpoint * FRAME_COUNT * FEATURE_DIM..(endpoint + 1) * FRAME_COUNT * FEATURE_DIM];
-                let ctx =
-                    &context[endpoint * 4 * hidden_size..(endpoint + 1) * 4 * hidden_size];
-                self.endpoint_offset(feat, ctx, &masks[endpoint], endpoint % 2)
-            })
-            .collect();
+        // 3. per-endpoint offsets (pre-projects slot rows & word means once,
+        //    then runs per-endpoint GEMM + attention with per-thread scratch)
+        let offsets = self.refine_offsets(&features, hidden, hidden_size, word_count);
 
         // 5. repair the corrected intervals, in the reference's order
         let mut intervals: Vec<[f64; 2]> = (0..word_count)
@@ -285,9 +290,107 @@ impl LocalHead {
             .collect())
     }
 
+    /// Project the unique slot rows and per-word means once via GEMM, then
+    /// evaluate all endpoints in parallel with per-thread scratch reuse.
+    fn refine_offsets(
+        &self,
+        features: &[f32],
+        hidden: &[f32],
+        hidden_size: usize,
+        word_count: usize,
+    ) -> Vec<f32> {
+        let slots = word_count * 2;
+        if slots == 0 {
+            return Vec::new();
+        }
+        let w = &self.weights;
+        let dim = w.model_dim;
+
+        // Compute per-word mean rows in the exact f32 order of `context_rows`.
+        let mut word_means = vec![0.0f32; word_count * hidden_size];
+        word_means
+            .par_chunks_mut(hidden_size)
+            .enumerate()
+            .for_each(|(word, dst)| {
+                let r0 = &hidden[(word * 2) * hidden_size..(word * 2 + 1) * hidden_size];
+                let r1 = &hidden[(word * 2 + 1) * hidden_size..(word * 2 + 2) * hidden_size];
+                for ((o, &a), &b) in dst.iter_mut().zip(r0).zip(r1) {
+                    *o = (a + b) * 0.5;
+                }
+            });
+
+        // Project each unique hidden row and word mean once instead of 6x.
+        let mut slot_proj = vec![0.0f32; slots * dim];
+        let mut mean_proj = vec![0.0f32; word_count * dim];
+        gemm_row_major_par(&mut slot_proj, hidden, &w.ctx_w, slots, dim, hidden_size, 0.0);
+        gemm_row_major_par(
+            &mut mean_proj,
+            &word_means,
+            &w.ctx_w,
+            word_count,
+            dim,
+            hidden_size,
+            0.0,
+        );
+
+        let mut offsets = vec![0.0f32; slots];
+        const CHUNK: usize = 8;
+        offsets
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each_init(
+                || EndpointScratch::new(dim),
+                |scratch, (chunk_index, out_chunk)| {
+                    let start = chunk_index * CHUNK;
+                    for (j, out) in out_chunk.iter_mut().enumerate() {
+                        let endpoint = start + j;
+                        let word = endpoint / 2;
+                        let s_row = &slot_proj[endpoint * dim..(endpoint + 1) * dim];
+                        let cur_row = &mean_proj[word * dim..(word + 1) * dim];
+                        let prev_row = if word > 0 {
+                            Some(&mean_proj[(word - 1) * dim..word * dim])
+                        } else {
+                            None
+                        };
+                        let next_row = if word + 1 < word_count {
+                            Some(&mean_proj[(word + 1) * dim..(word + 2) * dim])
+                        } else {
+                            None
+                        };
+
+                        for d in 0..dim {
+                            let b = w.ctx_b[d];
+                            scratch.tokens[d] = s_row[d] + (b + w.role[d]);
+                            scratch.tokens[dim + d] = cur_row[d] + (b + w.role[dim + d]);
+                            scratch.tokens[2 * dim + d] =
+                                prev_row.map_or(0.0, |r| r[d]) + (b + w.role[2 * dim + d]);
+                            scratch.tokens[3 * dim + d] =
+                                next_row.map_or(0.0, |r| r[d]) + (b + w.role[3 * dim + d]);
+                        }
+                        let mask: ContextMask = [
+                            1.0,
+                            1.0,
+                            if word > 0 { 1.0 } else { 0.0 },
+                            if word + 1 < word_count { 1.0 } else { 0.0 },
+                        ];
+                        let feat = &features[endpoint * FRAME_COUNT * FEATURE_DIM
+                            ..(endpoint + 1) * FRAME_COUNT * FEATURE_DIM];
+                        *out = self.endpoint_offset_from_tokens(
+                            feat,
+                            &mask,
+                            endpoint % 2,
+                            scratch,
+                        );
+                    }
+                },
+            );
+        offsets
+    }
+
     /// `_context_for_sample`: `[slot, current avg, prev avg, next avg]` per
     /// endpoint, with the missing neighbours at the edges as zeros but flagged
     /// in the mask.
+    #[cfg(test)]
     fn context_rows(
         &self,
         hidden: &[f32],
@@ -311,7 +414,11 @@ impl LocalHead {
         let mut masks = vec![[0.0f32; 4]; word_count * 2];
         for w in 0..word_count {
             let current = mean(w * 2, w * 2 + 2);
-            let previous = if w > 0 { mean(w * 2 - 2, w * 2) } else { vec![0.0; hidden_size] };
+            let previous = if w > 0 {
+                mean(w * 2 - 2, w * 2)
+            } else {
+                vec![0.0; hidden_size]
+            };
             let next = if w + 1 < word_count {
                 mean(w * 2 + 2, w * 2 + 4)
             } else {
@@ -322,7 +429,8 @@ impl LocalHead {
                 let base = slot * 4 * hidden_size;
                 let roles = [row(slot), &current[..], &previous[..], &next[..]];
                 for (role, source) in roles.into_iter().enumerate() {
-                    let dst = &mut context[base + role * hidden_size..base + (role + 1) * hidden_size];
+                    let dst =
+                        &mut context[base + role * hidden_size..base + (role + 1) * hidden_size];
                     dst.copy_from_slice(source);
                 }
                 masks[slot] = [
@@ -339,115 +447,317 @@ impl LocalHead {
     /// `extract_fixed_center_features`: `[N][41][91]`, normalized.
     fn features(&self, samples: &[f32], centers_ms: &[i64]) -> Vec<f32> {
         let mut out = vec![0.0f32; centers_ms.len() * FRAME_COUNT * FEATURE_DIM];
+        if centers_ms.is_empty() {
+            return out;
+        }
+        // The 80 ms coarse grid is always a multiple of the 10 ms hop; the
+        // global path only applies when *every* center is on that grid.
+        let hop_ms = HOP_MS as i64;
+        if centers_ms.iter().any(|&c| c % hop_ms != 0) {
+            out.par_chunks_mut(FRAME_COUNT * FEATURE_DIM)
+                .zip(centers_ms.par_iter())
+                .for_each(|(dst, &center_ms)| self.features_one(samples, center_ms, dst));
+            return out;
+        }
+
+        let half_ctx = (CONTEXT_MS / HOP_MS) as i64; // 20
+        let hop = (HOP_MS * SAMPLE_RATE / 1000) as i64; // 160 samples
+        let frame_len = FRAME_MS * SAMPLE_RATE / 1000; // 400 samples
+        let bins = N_FFT / 2 + 1; // 257
+
+        let mut min_frame = i64::MAX;
+        let mut max_frame = i64::MIN;
+        for &center_ms in centers_ms {
+            let center_frame = center_ms / hop_ms;
+            min_frame = min_frame.min(center_frame - half_ctx);
+            max_frame = max_frame.max(center_frame + (FRAME_COUNT as i64 - 1 - half_ctx));
+        }
+        let total_frames = (max_frame - min_frame + 1) as usize;
+        // Guard against pathological sparse inputs (a few endpoints very far
+        // apart): a per-endpoint pass is cheaper than a giant global span.
+        if total_frames > centers_ms.len() * FRAME_COUNT {
+            out.par_chunks_mut(FRAME_COUNT * FEATURE_DIM)
+                .zip(centers_ms.par_iter())
+                .for_each(|(dst, &center_ms)| self.features_one(samples, center_ms, dst));
+            return out;
+        }
+
+        // Mark frames that at least one endpoint actually uses; long silence
+        // gaps between sparse clusters are then skipped.
+        let mut needed = vec![false; total_frames];
+        for &center_ms in centers_ms {
+            let center_frame = center_ms / hop_ms;
+            let first = center_frame - half_ctx - min_frame;
+            let last = first + FRAME_COUNT as i64 - 1;
+            for gi in first as usize..=last as usize {
+                needed[gi] = true;
+            }
+        }
+
+        let mut log_rms = vec![0.0f32; total_frames];
+        let mut magnitude = vec![0.0f32; total_frames * bins];
+        let mut log_mel = vec![0.0f32; total_frames * N_MELS];
+        let mut normalised = vec![0.0f32; total_frames * bins];
+
+        // One FFT per needed global frame, parallel over chunks of frames.
+        // FFT buffer + scratch are allocated once per rayon worker thread.
+        const FRAME_CHUNK: usize = 64;
+        log_rms
+            .par_chunks_mut(FRAME_CHUNK)
+            .zip(magnitude.par_chunks_mut(FRAME_CHUNK * bins))
+            .zip(log_mel.par_chunks_mut(FRAME_CHUNK * N_MELS))
+            .zip(normalised.par_chunks_mut(FRAME_CHUNK * bins))
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        vec![Complex::new(0.0f64, 0.0); N_FFT],
+                        vec![Complex::new(0.0f64, 0.0); self.fft_scratch_len],
+                    )
+                },
+                |(buffer, scratch), (chunk_idx, (((rms_chunk, mag_chunk), mel_chunk), norm_chunk))| {
+                    let base = chunk_idx * FRAME_CHUNK;
+                    let mut frame = [0.0f32; 400];
+                    let mut power = [0.0f32; N_FFT / 2 + 1];
+                    for local_gi in 0..rms_chunk.len() {
+                        let gi = base + local_gi;
+                        if !needed[gi] {
+                            continue;
+                        }
+                        let g = min_frame + gi as i64;
+                        let start = g * hop - (frame_len / 2) as i64;
+                        let mut acc = 0.0f32;
+                        if start >= 0 && (start as usize) + frame_len <= samples.len() {
+                            let src = &samples[start as usize..start as usize + frame_len];
+                            for i in 0..frame_len {
+                                let v = src[i] * self.hann[i];
+                                frame[i] = v;
+                                acc += v * v;
+                            }
+                        } else {
+                            frame.fill(0.0);
+                            for i in 0..frame_len {
+                                let index = start + i as i64;
+                                if index >= 0 && (index as usize) < samples.len() {
+                                    let v = samples[index as usize] * self.hann[i];
+                                    frame[i] = v;
+                                    acc += v * v;
+                                }
+                            }
+                        }
+                        rms_chunk[local_gi] = (acc / frame_len as f32 + LOG_EPSILON)
+                            .sqrt()
+                            .max(LOG_EPSILON)
+                            .ln();
+
+                        for i in 0..frame_len {
+                            buffer[i] = Complex::new(frame[i] as f64, 0.0);
+                        }
+                        for b in &mut buffer[frame_len..N_FFT] {
+                            *b = Complex::new(0.0, 0.0);
+                        }
+                        self.fft.process_with_scratch(buffer, scratch);
+                        let mag = &mut mag_chunk[local_gi * bins..(local_gi + 1) * bins];
+                        for b in 0..bins {
+                            let m = buffer[b].norm() as f32;
+                            mag[b] = m;
+                            power[b] = m * m;
+                        }
+
+                        // Sparse mel accumulation: bit-identical, ~25x fewer multiplies.
+                        for m in 0..N_MELS {
+                            let (start_bin, end_bin) = self.mel_ranges[m];
+                            let bank = &self.bank[m * bins + start_bin..m * bins + end_bin];
+                            let mut acc = 0.0f32;
+                            for (b, &weight) in bank.iter().enumerate() {
+                                acc += weight * power[start_bin + b];
+                            }
+                            mel_chunk[local_gi * N_MELS + m] = acc.max(LOG_EPSILON).ln();
+                        }
+
+                        let row = &mut norm_chunk[local_gi * bins..(local_gi + 1) * bins];
+                        let mut mean = 0.0f32;
+                        for (b, v) in row.iter_mut().enumerate() {
+                            let value = mag[b].max(LOG_EPSILON).ln();
+                            *v = value;
+                            mean += value;
+                        }
+                        mean /= bins as f32;
+                        for v in row.iter_mut() {
+                            *v -= mean;
+                        }
+                    }
+                },
+            );
+
+        // Adjacent-frame features, computed once for each needed pair.
+        let edges = band_edges(bins);
+        let mut adj_flux = vec![0.0f32; total_frames];
+        let mut adj_dist = vec![0.0f32; total_frames * SPECTRAL_BANDS];
+        adj_flux
+            .par_chunks_mut(FRAME_CHUNK)
+            .zip(adj_dist.par_chunks_mut(FRAME_CHUNK * SPECTRAL_BANDS))
+            .enumerate()
+            .for_each(|(chunk_idx, (fchunk, dchunk))| {
+                let first = chunk_idx * FRAME_CHUNK;
+                for offset in 0..fchunk.len() {
+                    let gi = first + offset;
+                    if gi == 0 || !needed[gi] || !needed[gi - 1] {
+                        continue;
+                    }
+                    let cur = &magnitude[gi * bins..(gi + 1) * bins];
+                    let prev = &magnitude[(gi - 1) * bins..gi * bins];
+                    let mut positive = 0.0f32;
+                    let mut total = 0.0f32;
+                    for b in 0..bins {
+                        positive += (cur[b] - prev[b]).max(0.0);
+                        total += prev[b];
+                    }
+                    fchunk[offset] = positive / (total + LOG_EPSILON);
+                    for band in 0..SPECTRAL_BANDS {
+                        let left = edges[band];
+                        let right = edges[band + 1].max(left + 1);
+                        let a = &normalised[(gi - 1) * bins + left..(gi - 1) * bins + right];
+                        let b = &normalised[gi * bins + left..gi * bins + right];
+                        let mut acc = 0.0f32;
+                        for i in 0..a.len() {
+                            acc += (b[i] - a[i]).abs();
+                        }
+                        dchunk[offset * SPECTRAL_BANDS + band] = acc / a.len() as f32;
+                    }
+                }
+            });
+
+        // Assemble each endpoint's 41-frame window from the global arrays.
+        // par_chunks_mut keeps each output region owned by one rayon worker.
         out.par_chunks_mut(FRAME_COUNT * FEATURE_DIM)
             .zip(centers_ms.par_iter())
-            .for_each(|(dst, &center_ms)| self.features_one(samples, center_ms, dst));
+            .for_each(|(dst, &center_ms)| {
+                let center_frame = center_ms / hop_ms;
+                let base_gi = (center_frame - half_ctx - min_frame) as usize;
+                for f in 0..FRAME_COUNT {
+                    let gi = base_gi + f;
+                    let row = &mut dst[f * FEATURE_DIM..(f + 1) * FEATURE_DIM];
+                    row[..N_MELS].copy_from_slice(&log_mel[gi * N_MELS..(gi + 1) * N_MELS]);
+                    row[N_MELS] = log_rms[gi];
+                    row[N_MELS + 1] = if f == 0 {
+                        0.0
+                    } else {
+                        log_rms[gi] - log_rms[gi - 1]
+                    };
+                    row[N_MELS + 2] = if f == 0 { 0.0 } else { adj_flux[gi] };
+                    for band in 0..SPECTRAL_BANDS {
+                        row[N_MELS + 3 + band] = if f == 0 {
+                            0.0
+                        } else {
+                            adj_dist[gi * SPECTRAL_BANDS + band]
+                        };
+                        row[N_MELS + 3 + SPECTRAL_BANDS + band] = if f + 1 == FRAME_COUNT {
+                            0.0
+                        } else {
+                            adj_dist[(gi + 1) * SPECTRAL_BANDS + band]
+                        };
+                    }
+                    for ((value, mean), std) in row.iter_mut().zip(&self.mean).zip(&self.std) {
+                        *value = (*value - *mean) / *std;
+                    }
+                }
+            });
         out
     }
 
+    /// Fallback path: one endpoint's local 41-frame window, used whenever a
+    /// center is off the 10 ms grid or the input is too sparse for the global
+    /// pass.  It computes the same per-frame primitives in place.
     fn features_one(&self, samples: &[f32], center_ms: i64, dst: &mut [f32]) {
         let frame_len = FRAME_MS * SAMPLE_RATE / 1000; // 400
-        let hop = HOP_MS * SAMPLE_RATE / 1000; // 160
+        let hop = (HOP_MS * SAMPLE_RATE / 1000) as i64; // 160
         let bins = N_FFT / 2 + 1; // 257
+        let half_ctx = (CONTEXT_MS / HOP_MS) as i64; // 20
         let center_sample = center_ms * (SAMPLE_RATE as i64) / 1000;
 
-        // 41 hann-windowed frames, zero-padded outside the audio
-        let mut frames = vec![0.0f32; FRAME_COUNT * frame_len];
+        let mut log_rms = [0.0f32; FRAME_COUNT];
+        let mut magnitude = vec![0.0f32; FRAME_COUNT * bins];
+        let mut log_mel = vec![0.0f32; FRAME_COUNT * N_MELS];
+        let mut normalised = vec![0.0f32; FRAME_COUNT * bins];
+        let mut buffer = vec![Complex::new(0.0f64, 0.0); N_FFT];
+        let mut scratch = vec![Complex::new(0.0f64, 0.0); self.fft_scratch_len];
         for f in 0..FRAME_COUNT {
-            let start = center_sample
-                + (f as i64 - (CONTEXT_MS / HOP_MS) as i64) * hop as i64
-                - (frame_len / 2) as i64;
-            let base = f * frame_len;
+            let start = center_sample + (f as i64 - half_ctx) * hop - (frame_len / 2) as i64;
+            let mut frame = [0.0f32; 400];
             for i in 0..frame_len {
                 let index = start + i as i64;
                 if index >= 0 && (index as usize) < samples.len() {
-                    frames[base + i] = samples[index as usize] * self.hann[i];
+                    frame[i] = samples[index as usize] * self.hann[i];
                 }
             }
-        }
-
-        // |X| per frame.  numpy's rfft widens to f64, so the transform is f64
-        // here too and only the magnitude is narrowed back to f32.
-        let mut magnitude = vec![0.0f32; FRAME_COUNT * bins];
-        let mut buffer = vec![Complex::new(0.0f64, 0.0); N_FFT];
-        for f in 0..FRAME_COUNT {
-            buffer.iter_mut().for_each(|b| *b = Complex::new(0.0, 0.0));
-            for i in 0..frame_len {
-                buffer[i].re = frames[f * frame_len + i] as f64;
-            }
-            self.fft.process(&mut buffer);
-            for b in 0..bins {
-                magnitude[f * bins + b] = buffer[b].norm() as f32;
-            }
-        }
-
-        let mut power = vec![0.0f32; FRAME_COUNT * bins];
-        for (p, m) in power.iter_mut().zip(&magnitude) {
-            *p = *m * *m;
-        }
-
-        let mut log_mel = vec![0.0f32; FRAME_COUNT * N_MELS];
-        for f in 0..FRAME_COUNT {
-            for m in 0..N_MELS {
-                let bank = &self.bank[m * bins..(m + 1) * bins];
-                let mut acc = 0.0f32;
-                for b in 0..bins {
-                    acc += bank[b] * power[f * bins + b];
-                }
-                log_mel[f * N_MELS + m] = acc.max(LOG_EPSILON).ln();
-            }
-        }
-
-        let mut log_rms = [0.0f32; FRAME_COUNT];
-        let mut delta_rms = [0.0f32; FRAME_COUNT];
-        for f in 0..FRAME_COUNT {
-            let frame = &frames[f * frame_len..(f + 1) * frame_len];
             let mut acc = 0.0f32;
-            for v in frame {
+            for &v in &frame {
                 acc += v * v;
             }
             log_rms[f] = (acc / frame_len as f32 + LOG_EPSILON)
                 .sqrt()
                 .max(LOG_EPSILON)
                 .ln();
-            delta_rms[f] = if f == 0 { 0.0 } else { log_rms[f] - log_rms[f - 1] };
-        }
 
-        // Mean-removed log spectrum, which the flux and distance channels read.
-        let mut normalised = vec![0.0f32; FRAME_COUNT * bins];
-        for f in 0..FRAME_COUNT {
-            let mut mean = 0.0f32;
+            buffer.fill(Complex::new(0.0, 0.0));
+            for i in 0..frame_len {
+                buffer[i].re = frame[i] as f64;
+            }
+            self.fft.process_with_scratch(&mut buffer, &mut scratch);
+            let mag = &mut magnitude[f * bins..(f + 1) * bins];
             for b in 0..bins {
-                let v = magnitude[f * bins + b].max(LOG_EPSILON).ln();
-                normalised[f * bins + b] = v;
-                mean += v;
+                mag[b] = buffer[b].norm() as f32;
+            }
+            for m in 0..N_MELS {
+                let (start_bin, end_bin) = self.mel_ranges[m];
+                let bank = &self.bank[m * bins + start_bin..m * bins + end_bin];
+                let mut acc = 0.0f32;
+                for (b, &weight) in bank.iter().enumerate() {
+                    let power = mag[start_bin + b] * mag[start_bin + b];
+                    acc += weight * power;
+                }
+                log_mel[f * N_MELS + m] = acc.max(LOG_EPSILON).ln();
+            }
+            let row = &mut normalised[f * bins..(f + 1) * bins];
+            let mut mean = 0.0f32;
+            for (b, v) in row.iter_mut().enumerate() {
+                let value = mag[b].max(LOG_EPSILON).ln();
+                *v = value;
+                mean += value;
             }
             mean /= bins as f32;
-            for b in 0..bins {
-                normalised[f * bins + b] -= mean;
+            for v in row.iter_mut() {
+                *v -= mean;
             }
         }
 
-        let mut flux = [0.0f32; FRAME_COUNT];
-        for f in 1..FRAME_COUNT {
-            let prev = &magnitude[(f - 1) * bins..f * bins];
-            let cur = &magnitude[f * bins..(f + 1) * bins];
-            let mut positive = 0.0f32;
-            let mut total = 0.0f32;
-            for b in 0..bins {
-                positive += (cur[b] - prev[b]).max(0.0);
-                total += prev[b];
-            }
-            flux[f] = positive / (total + LOG_EPSILON);
-        }
-
-        // Spectral distance to the previous/next frame inside four bands.
         let edges = band_edges(bins);
-        let mut distance = vec![0.0f32; FRAME_COUNT * SPECTRAL_BANDS * 2];
-        for band in 0..SPECTRAL_BANDS {
-            let left = edges[band];
-            let right = edges[band + 1].max(left + 1);
-            for f in 0..FRAME_COUNT {
+        for f in 0..FRAME_COUNT {
+            let row = &mut dst[f * FEATURE_DIM..(f + 1) * FEATURE_DIM];
+            row[..N_MELS].copy_from_slice(&log_mel[f * N_MELS..(f + 1) * N_MELS]);
+            row[N_MELS] = log_rms[f];
+            row[N_MELS + 1] = if f == 0 {
+                0.0
+            } else {
+                log_rms[f] - log_rms[f - 1]
+            };
+            if f == 0 {
+                row[N_MELS + 2] = 0.0;
+            } else {
+                let cur = &magnitude[f * bins..(f + 1) * bins];
+                let prev = &magnitude[(f - 1) * bins..f * bins];
+                let mut positive = 0.0f32;
+                let mut total = 0.0f32;
+                for b in 0..bins {
+                    positive += (cur[b] - prev[b]).max(0.0);
+                    total += prev[b];
+                }
+                row[N_MELS + 2] = positive / (total + LOG_EPSILON);
+            }
+            for band in 0..SPECTRAL_BANDS {
+                let left = edges[band];
+                let right = edges[band + 1].max(left + 1);
                 let cur = &normalised[f * bins + left..f * bins + right];
                 let near_l = if f == 0 {
                     cur
@@ -466,21 +776,9 @@ impl LocalHead {
                     acc_r += (cur[i] - near_r[i]).abs();
                 }
                 let width = cur.len() as f32;
-                distance[f * SPECTRAL_BANDS * 2 + band] = acc_l / width;
-                distance[f * SPECTRAL_BANDS * 2 + SPECTRAL_BANDS + band] = acc_r / width;
+                row[N_MELS + 3 + band] = acc_l / width;
+                row[N_MELS + 3 + SPECTRAL_BANDS + band] = acc_r / width;
             }
-        }
-
-        // [41][91]: 80 log-mel, log-RMS, delta, flux, 8 distances — then the
-        // train-stat normalizer, channel by channel.
-        for f in 0..FRAME_COUNT {
-            let row = &mut dst[f * FEATURE_DIM..(f + 1) * FEATURE_DIM];
-            row[..N_MELS].copy_from_slice(&log_mel[f * N_MELS..(f + 1) * N_MELS]);
-            row[N_MELS] = log_rms[f];
-            row[N_MELS + 1] = delta_rms[f];
-            row[N_MELS + 2] = flux[f];
-            row[N_MELS + 3..]
-                .copy_from_slice(&distance[f * SPECTRAL_BANDS * 2..(f + 1) * SPECTRAL_BANDS * 2]);
             for ((value, mean), std) in row.iter_mut().zip(&self.mean).zip(&self.std) {
                 *value = (*value - *mean) / *std;
             }
@@ -489,125 +787,410 @@ impl LocalHead {
 
     /// One endpoint through `IdentityConditionedBoundaryHead`; the decoded
     /// offset in milliseconds.
+    #[cfg(test)]
     fn endpoint_offset(&self, feat: &[f32], ctx: &[f32], mask: &ContextMask, is_end: usize) -> f32 {
         let w = &self.weights;
         let dim = w.model_dim;
-
-        // conv1: [91][41] -> [128][41] -> GELU; conv2 over the 128 channels
-        let mut hidden_a = vec![0.0f32; dim * FRAME_COUNT];
-        for c in 0..dim {
-            for t in 0..FRAME_COUNT {
-                let mut acc = w.conv1_b[c];
-                for k in 0..5 {
-                    let tt = t as isize + k as isize - 2;
-                    if !(0..FRAME_COUNT as isize).contains(&tt) {
-                        continue;
-                    }
-                    let tt = tt as usize;
-                    for ic in 0..FEATURE_DIM {
-                        acc += w.conv1_w[(c * FEATURE_DIM + ic) * 5 + k] * feat[tt * FEATURE_DIM + ic];
-                    }
-                }
-                hidden_a[c * FRAME_COUNT + t] = gelu(acc);
-            }
-        }
-        let mut hidden_b = vec![0.0f32; dim * FRAME_COUNT];
-        for c in 0..dim {
-            for t in 0..FRAME_COUNT {
-                let mut acc = w.conv2_b[c];
-                for k in 0..5 {
-                    let tt = t as isize + k as isize - 2;
-                    if !(0..FRAME_COUNT as isize).contains(&tt) {
-                        continue;
-                    }
-                    let tt = tt as usize;
-                    for ic in 0..dim {
-                        acc += w.conv2_w[(c * dim + ic) * 5 + k] * hidden_a[ic * FRAME_COUNT + tt];
-                    }
-                }
-                hidden_b[c * FRAME_COUNT + t] = gelu(acc);
-            }
-        }
-        // [41][128], frame-major, which is the layout attention wants
-        let mut audio = vec![0.0f32; FRAME_COUNT * dim];
-        for t in 0..FRAME_COUNT {
-            for d in 0..dim {
-                audio[t * dim + d] = hidden_b[d * FRAME_COUNT + t];
-            }
-        }
-
-        // context projection + role embedding
-        let mut tokens = vec![0.0f32; 4 * dim];
+        let mut scratch = EndpointScratch::new(dim);
+        gemm_row_major(
+            &mut scratch.tokens,
+            ctx,
+            &w.ctx_w,
+            4,
+            dim,
+            w.context_in,
+            0.0,
+        );
         for r in 0..4 {
             for d in 0..dim {
-                let mut acc = w.ctx_b[d] + w.role[r * dim + d];
-                for j in 0..w.context_in {
-                    acc += w.ctx_w[d * w.context_in + j] * ctx[r * w.context_in + j];
-                }
-                tokens[r * dim + d] = acc;
+                let i = r * dim + d;
+                scratch.tokens[i] += w.ctx_b[d] + w.role[r * dim + d];
             }
         }
-        let base_query: Vec<f32> = (0..dim).map(|d| tokens[d] + w.endpoint[is_end * dim + d]).collect();
+        self.endpoint_offset_from_tokens(feat, mask, is_end, &mut scratch)
+    }
 
-        // context attention: one query, four masked keys
-        let proj_row = |x: &[f32], weight: &[f32], bias: &[f32]| -> Vec<f32> {
-            let mut out = vec![0.0f32; dim];
-            for d in 0..dim {
-                let mut acc = bias[d];
-                for j in 0..dim {
-                    acc += weight[d * dim + j] * x[j];
+    /// Fast single-endpoint path assuming `scratch.tokens` (`[4, dim]`) is
+    /// already populated with projected context tokens + bias + role embedding.
+    fn endpoint_offset_from_tokens(
+        &self,
+        feat: &[f32],
+        mask: &ContextMask,
+        is_end: usize,
+        scratch: &mut EndpointScratch,
+    ) -> f32 {
+        let w = &self.weights;
+        let dim = w.model_dim;
+        let frames = FRAME_COUNT;
+
+        // ---- conv1: [41][91] im2col -> [41, 128] -> GELU ----
+        let im1 = &mut scratch.im1;
+        for t in 0..frames {
+            let row = &mut im1[t * 5 * FEATURE_DIM..(t + 1) * 5 * FEATURE_DIM];
+            if t >= 2 && t + 2 < frames {
+                row.copy_from_slice(&feat[(t - 2) * FEATURE_DIM..(t + 3) * FEATURE_DIM]);
+            } else {
+                row.fill(0.0);
+                for k in 0..5 {
+                    let tt = t as isize + k as isize - 2;
+                    if (0..frames as isize).contains(&tt) {
+                        let src =
+                            &feat[tt as usize * FEATURE_DIM..(tt as usize + 1) * FEATURE_DIM];
+                        row[k * FEATURE_DIM..(k + 1) * FEATURE_DIM].copy_from_slice(src);
+                    }
                 }
-                out[d] = acc;
             }
-            out
-        };
-        let q = proj_row(&base_query, &w.cq, &w.cbq);
-        let keys: Vec<Vec<f32>> = (0..4).map(|r| proj_row(&tokens[r * dim..(r + 1) * dim], &w.ck, &w.cbk)).collect();
-        let values: Vec<Vec<f32>> = (0..4).map(|r| proj_row(&tokens[r * dim..(r + 1) * dim], &w.cv, &w.cbv)).collect();
-        let attended = attention(&q, &keys, &values, Some(mask), dim, w.heads);
-        let projected = proj_row(&attended, &w.co_w, &w.co_b);
+        }
+        gemm_row_major(
+            &mut scratch.hidden_a,
+            im1,
+            &w.conv1_w,
+            frames,
+            dim,
+            5 * FEATURE_DIM,
+            0.0,
+        );
+        for t in 0..frames {
+            let row = &mut scratch.hidden_a[t * dim..(t + 1) * dim];
+            for (v, &b) in row.iter_mut().zip(&w.conv1_b) {
+                *v = gelu(*v + b);
+            }
+        }
 
-        // residual + query_norm, then attention over the 41 acoustic frames
-        let mut query: Vec<f32> = (0..dim).map(|d| projected[d] + base_query[d]).collect();
-        layer_norm(&mut query, &w.qn_w, &w.qn_b);
+        // ---- conv2: [41][128] im2col -> [41, 128] -> GELU ----
+        let im2 = &mut scratch.im2;
+        for t in 0..frames {
+            let row = &mut im2[t * 5 * dim..(t + 1) * 5 * dim];
+            if t >= 2 && t + 2 < frames {
+                row.copy_from_slice(&scratch.hidden_a[(t - 2) * dim..(t + 3) * dim]);
+            } else {
+                row.fill(0.0);
+                for k in 0..5 {
+                    let tt = t as isize + k as isize - 2;
+                    if (0..frames as isize).contains(&tt) {
+                        let src = &scratch.hidden_a[tt as usize * dim..(tt as usize + 1) * dim];
+                        row[k * dim..(k + 1) * dim].copy_from_slice(src);
+                    }
+                }
+            }
+        }
+        gemm_row_major(
+            &mut scratch.audio,
+            im2,
+            &w.conv2_w,
+            frames,
+            dim,
+            5 * dim,
+            0.0,
+        );
+        for t in 0..frames {
+            let row = &mut scratch.audio[t * dim..(t + 1) * dim];
+            for (v, &b) in row.iter_mut().zip(&w.conv2_b) {
+                *v = gelu(*v + b);
+            }
+        }
 
-        let q = proj_row(&query, &w.aq, &w.abq);
-        let keys: Vec<Vec<f32>> = (0..FRAME_COUNT)
-            .map(|t| proj_row(&audio[t * dim..(t + 1) * dim], &w.ak, &w.abk))
-            .collect();
-        let values: Vec<Vec<f32>> = (0..FRAME_COUNT)
-            .map(|t| proj_row(&audio[t * dim..(t + 1) * dim], &w.av, &w.abv))
-            .collect();
-        let attended = attention(&q, &keys, &values, None, dim, w.heads);
-        let projected = proj_row(&attended, &w.ao_w, &w.ao_b);
+        // ---- context attention (4 masked keys) ----
+        let tokens = &scratch.tokens[..4 * dim];
+        let base_query = &mut scratch.base_query[..dim];
+        for d in 0..dim {
+            base_query[d] = tokens[d] + w.endpoint[is_end * dim + d];
+        }
+        matvec_bias(&mut scratch.cq, base_query, &w.cq, &w.cbq, dim, dim);
+        gemm_row_major(&mut scratch.ck, tokens, &w.ck, 4, dim, dim, 0.0);
+        gemm_row_major(&mut scratch.cv, tokens, &w.cv, 4, dim, dim, 0.0);
+        for r in 0..4 {
+            let ck_row = &mut scratch.ck[r * dim..(r + 1) * dim];
+            let cv_row = &mut scratch.cv[r * dim..(r + 1) * dim];
+            for d in 0..dim {
+                ck_row[d] += w.cbk[d];
+                cv_row[d] += w.cbv[d];
+            }
+        }
+        let attended = &mut scratch.ctx_attended[..dim];
+        attention_flat(
+            attended,
+            &scratch.cq[..dim],
+            &scratch.ck[..4 * dim],
+            &scratch.cv[..4 * dim],
+            Some(mask),
+            dim,
+            w.heads,
+            &mut scratch.ctx_scores[..4],
+        );
+        matvec_bias(
+            &mut scratch.ctx_projected,
+            attended,
+            &w.co_w,
+            &w.co_b,
+            dim,
+            dim,
+        );
 
-        let mut query: Vec<f32> = (0..dim).map(|d| projected[d] + query[d]).collect();
-        layer_norm(&mut query, &w.qn_w, &w.qn_b);
+        // ---- query residual + norm ----
+        let query = &mut scratch.query[..dim];
+        for d in 0..dim {
+            query[d] = scratch.ctx_projected[d] + base_query[d];
+        }
+        layer_norm(query, &w.qn_w, &w.qn_b);
 
-        let mut audio_norm = audio;
-        for t in 0..FRAME_COUNT {
+        // ---- audio attention over 41 frames ----
+        matvec_bias(&mut scratch.aq, query, &w.aq, &w.abq, dim, dim);
+        gemm_row_major(
+            &mut scratch.ak,
+            &scratch.audio,
+            &w.ak,
+            frames,
+            dim,
+            dim,
+            0.0,
+        );
+        gemm_row_major(
+            &mut scratch.av,
+            &scratch.audio,
+            &w.av,
+            frames,
+            dim,
+            dim,
+            0.0,
+        );
+        for t in 0..frames {
+            let ak_row = &mut scratch.ak[t * dim..(t + 1) * dim];
+            let av_row = &mut scratch.av[t * dim..(t + 1) * dim];
+            for d in 0..dim {
+                ak_row[d] += w.abk[d];
+                av_row[d] += w.abv[d];
+            }
+        }
+        let attended = &mut scratch.audio_attended[..dim];
+        attention_flat(
+            attended,
+            &scratch.aq[..dim],
+            &scratch.ak[..frames * dim],
+            &scratch.av[..frames * dim],
+            None,
+            dim,
+            w.heads,
+            &mut scratch.audio_scores[..frames],
+        );
+        matvec_bias(
+            &mut scratch.audio_projected,
+            attended,
+            &w.ao_w,
+            &w.ao_b,
+            dim,
+            dim,
+        );
+        for d in 0..dim {
+            query[d] += scratch.audio_projected[d];
+        }
+        layer_norm(query, &w.qn_w, &w.qn_b);
+
+        // ---- audio norm (in-place) + activity/boundary logits + posterior mean ----
+        let audio_norm = &mut scratch.audio[..frames * dim];
+        for t in 0..frames {
             layer_norm(&mut audio_norm[t * dim..(t + 1) * dim], &w.an_w, &w.an_b);
         }
-
         let root = (dim as f32).sqrt();
-        let frame = |t: usize| &audio_norm[t * dim..(t + 1) * dim];
         let mut activity = [0.0f32; FRAME_COUNT];
         for (t, value) in activity.iter_mut().enumerate() {
-            let row = frame(t);
-            *value = dot(row, &query) / root + dot(&w.act_w, row) + w.act_b;
+            let row = &audio_norm[t * dim..(t + 1) * dim];
+            *value = dot(row, query) / root + dot(&w.act_w, row) + w.act_b;
         }
         let mut logits = [0.0f32; OFFSETS_MS.len()];
         for j in 0..OFFSETS_MS.len() {
-            let row = frame(14 + j);
-            let local = dot(row, &query) / root + dot(&w.bnd_w, row) + w.bnd_b;
+            let row = &audio_norm[(14 + j) * dim..(15 + j) * dim];
+            let local = dot(row, query) / root + dot(&w.bnd_w, row) + w.bnd_b;
             let derivative = activity[14 + j] - activity[14 + j - 1];
             let direction = if is_end == 0 { derivative } else { -derivative };
             logits[j] = local + w.derivative_scale * direction + w.prior[j];
         }
-
-        let probabilities = softmax_scaled(&logits, DECODER_TEMPERATURE);
-        probabilities.iter().zip(OFFSETS_MS).map(|(p, o)| p * o).sum()
+        softmax_mean(&logits, DECODER_TEMPERATURE)
     }
+}
+
+/// Reusable per-thread scratch for one endpoint's inference.  All buffers
+/// are heap-allocated once per rayon worker thread and overwritten in place.
+struct EndpointScratch {
+    im1: Vec<f32>,
+    im2: Vec<f32>,
+    hidden_a: Vec<f32>,
+    audio: Vec<f32>,
+    tokens: Vec<f32>,
+    base_query: Vec<f32>,
+    cq: Vec<f32>,
+    ck: Vec<f32>,
+    cv: Vec<f32>,
+    ctx_attended: Vec<f32>,
+    ctx_projected: Vec<f32>,
+    ctx_scores: Vec<f32>,
+    query: Vec<f32>,
+    aq: Vec<f32>,
+    ak: Vec<f32>,
+    av: Vec<f32>,
+    audio_attended: Vec<f32>,
+    audio_projected: Vec<f32>,
+    audio_scores: Vec<f32>,
+}
+
+impl EndpointScratch {
+    fn new(dim: usize) -> Self {
+        let f = |n: usize| vec![0.0f32; n];
+        Self {
+            im1: f(FRAME_COUNT * 5 * FEATURE_DIM),
+            im2: f(FRAME_COUNT * 5 * dim),
+            hidden_a: f(FRAME_COUNT * dim),
+            audio: f(FRAME_COUNT * dim),
+            tokens: f(4 * dim),
+            base_query: f(dim),
+            cq: f(dim),
+            ck: f(4 * dim),
+            cv: f(4 * dim),
+            ctx_attended: f(dim),
+            ctx_projected: f(dim),
+            ctx_scores: f(4),
+            query: f(dim),
+            aq: f(dim),
+            ak: f(FRAME_COUNT * dim),
+            av: f(FRAME_COUNT * dim),
+            audio_attended: f(dim),
+            audio_projected: f(dim),
+            audio_scores: f(FRAME_COUNT),
+        }
+    }
+}
+
+/// `out[r][o] = Σ_k x[r][k] * w[o][k]`, row-major throughout.  Uses
+/// `gemm::Parallelism::None` because callers already run under rayon.
+fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: usize, beta: f32) {
+    gemm_row_major_impl(out, x, w, m, n, k, beta, gemm::Parallelism::None);
+}
+
+/// Same as [`gemm_row_major`], parallelised across rayon for large outer calls.
+fn gemm_row_major_par(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    beta: f32,
+) {
+    gemm_row_major_impl(out, x, w, m, n, k, beta, gemm::Parallelism::Rayon(0));
+}
+
+fn gemm_row_major_impl(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    beta: f32,
+    parallelism: gemm::Parallelism,
+) {
+    debug_assert_eq!(out.len(), m * n);
+    debug_assert_eq!(x.len(), m * k);
+    debug_assert_eq!(w.len(), n * k);
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            out.as_mut_ptr(),
+            1,
+            n as isize,
+            beta != 0.0,
+            x.as_ptr(),
+            1,
+            k as isize,
+            w.as_ptr(),
+            k as isize,
+            1,
+            beta,
+            1.0,
+            false,
+            false,
+            false,
+            parallelism,
+        );
+    }
+}
+
+/// Single-row linear layer `out[o] = dot(w[o], x) + bias[o]`, avoiding `gemm`
+/// dispatch overhead for `m = 1` projections.
+#[inline]
+fn matvec_bias(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], n: usize, k: usize) {
+    for o in 0..n {
+        out[o] = dot(&w[o * k..(o + 1) * k], x) + bias[o];
+    }
+}
+
+/// Flat-slice multi-head attention: one query, `n` keys/values packed as
+/// `[n][dim]`, writing `[dim]`.  `scores` is caller-provided scratch `[n]`
+/// (normalised in place, zero heap allocations).
+fn attention_flat(
+    out: &mut [f32],
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    mask: Option<&ContextMask>,
+    dim: usize,
+    heads: usize,
+    scores: &mut [f32],
+) {
+    let head_dim = dim / heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n = scores.len();
+    for h in 0..heads {
+        let q = &query[h * head_dim..(h + 1) * head_dim];
+        for r in 0..n {
+            let k = &keys[r * dim + h * head_dim..r * dim + (h + 1) * head_dim];
+            let mut acc = 0.0f32;
+            for d in 0..head_dim {
+                acc += q[d] * k[d];
+            }
+            scores[r] = acc * scale;
+            if let Some(mask) = mask {
+                if mask[r] == 0.0 {
+                    scores[r] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        softmax_in_place(scores);
+        let dst = &mut out[h * head_dim..(h + 1) * head_dim];
+        dst.fill(0.0);
+        for r in 0..n {
+            let p = scores[r];
+            let v = &values[r * dim + h * head_dim..r * dim + (h + 1) * head_dim];
+            for d in 0..head_dim {
+                dst[d] += p * v[d];
+            }
+        }
+    }
+}
+
+/// Softmax at `temperature`, then the posterior mean over `OFFSETS_MS`,
+/// computed without heap allocation.
+fn softmax_mean(scores: &[f32], temperature: f32) -> f32 {
+    let mut scaled = [0.0f32; OFFSETS_MS.len()];
+    for (s, v) in scaled.iter_mut().zip(scores) {
+        *s = *v / temperature;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for &v in &scaled {
+        max = max.max(v);
+    }
+    let mut total = 0.0f32;
+    for v in scaled.iter_mut() {
+        *v = (*v - max).exp();
+        total += *v;
+    }
+    let mut mean = 0.0f32;
+    for (p, o) in scaled.iter().zip(OFFSETS_MS) {
+        mean += (*p / total) * o;
+    }
+    mean
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +1242,11 @@ struct NormalizerFile {
 
 impl HeadFile {
     fn validate(&self) -> Result<()> {
-        ensure!(self.schema == SCHEMA, "local head schema {:?} != {SCHEMA:?}", self.schema);
+        ensure!(
+            self.schema == SCHEMA,
+            "local head schema {:?} != {SCHEMA:?}",
+            self.schema
+        );
         ensure!(
             self.architecture == ARCHITECTURE,
             "local head architecture {:?} != {ARCHITECTURE:?}",
@@ -684,38 +1271,74 @@ impl HeadFile {
                     .all(|(a, b)| (*a - b as f64).abs() <= 1e-6),
             "local head offsets_ms must be ±60 ms in 10 ms steps"
         );
-        close(self.decoder_temperature, DECODER_TEMPERATURE as f64, "decoder_temperature")?;
+        close(
+            self.decoder_temperature,
+            DECODER_TEMPERATURE as f64,
+            "decoder_temperature",
+        )?;
         close(self.decoder_amplitude, 1.0, "decoder_amplitude")?;
-        close(self.inference_prior_scale, INFERENCE_PRIOR_SCALE, "inference_prior_scale")?;
+        close(
+            self.inference_prior_scale,
+            INFERENCE_PRIOR_SCALE,
+            "inference_prior_scale",
+        )?;
 
         let f = &self.feature_contract;
-        ensure!(f.center_source == "fixed", "feature center_source must be \"fixed\"");
-        ensure!(f.context_ms as usize == CONTEXT_MS, "feature context_ms must be {CONTEXT_MS}");
-        ensure!(f.feature_dim == FEATURE_DIM, "feature dim must be {FEATURE_DIM}");
-        ensure!(f.frame_count == FRAME_COUNT, "feature frame_count must be {FRAME_COUNT}");
-        ensure!(f.frame_ms == FRAME_MS, "feature frame_ms must be {FRAME_MS}");
+        ensure!(
+            f.center_source == "fixed",
+            "feature center_source must be \"fixed\""
+        );
+        ensure!(
+            f.context_ms as usize == CONTEXT_MS,
+            "feature context_ms must be {CONTEXT_MS}"
+        );
+        ensure!(
+            f.feature_dim == FEATURE_DIM,
+            "feature dim must be {FEATURE_DIM}"
+        );
+        ensure!(
+            f.frame_count == FRAME_COUNT,
+            "feature frame_count must be {FRAME_COUNT}"
+        );
+        ensure!(
+            f.frame_ms == FRAME_MS,
+            "feature frame_ms must be {FRAME_MS}"
+        );
         ensure!(f.hop_ms == HOP_MS, "feature hop_ms must be {HOP_MS}");
         ensure!(f.n_fft == N_FFT, "feature n_fft must be {N_FFT}");
         ensure!(f.n_mels == N_MELS, "feature n_mels must be {N_MELS}");
-        ensure!(f.sample_rate == SAMPLE_RATE, "feature sample_rate must be {SAMPLE_RATE}");
+        ensure!(
+            f.sample_rate == SAMPLE_RATE,
+            "feature sample_rate must be {SAMPLE_RATE}"
+        );
         ensure!(
             f.spectral_distance_bands == SPECTRAL_BANDS,
             "feature spectral_distance_bands must be {SPECTRAL_BANDS}"
         );
 
         let m = &self.model_config;
-        ensure!(m.acoustic_dim == FEATURE_DIM, "model_config.acoustic_dim must be {FEATURE_DIM}");
+        ensure!(
+            m.acoustic_dim == FEATURE_DIM,
+            "model_config.acoustic_dim must be {FEATURE_DIM}"
+        );
         ensure!(m.qwen_dim == 1024, "model_config.qwen_dim must be 1024");
         ensure!(m.model_dim == 128, "model_config.model_dim must be 128");
         ensure!(m.heads == 4, "model_config.heads must be 4");
-        close(m.prior_sigma_ms, PRIOR_SIGMA_MS, "model_config.prior_sigma_ms")?;
+        close(
+            m.prior_sigma_ms,
+            PRIOR_SIGMA_MS,
+            "model_config.prior_sigma_ms",
+        )?;
         close(m.activity_weight, 0.25, "model_config.activity_weight")?;
         Ok(())
     }
 }
 
 fn close(a: f64, b: f64, what: &str) -> Result<()> {
-    ensure!((a - b).abs() <= 1e-6, "{what} {a} != the accepted head's {b}");
+    ensure!(
+        (a - b).abs() <= 1e-6,
+        "{what} {a} != the accepted head's {b}"
+    );
     Ok(())
 }
 
@@ -840,8 +1463,14 @@ impl Weights {
             let tensor = st
                 .tensor(name)
                 .with_context(|| format!("local head tensor {name}"))?;
-            ensure!(tensor.dtype() == Dtype::F32, "local head tensor {name} must be F32");
-            ensure!(tensor.data().len() == 4, "local head tensor {name} must be scalar");
+            ensure!(
+                tensor.dtype() == Dtype::F32,
+                "local head tensor {name} must be F32"
+            );
+            ensure!(
+                tensor.data().len() == 4,
+                "local head tensor {name} must be scalar"
+            );
             Ok(f32::from_le_bytes([
                 tensor.data()[0],
                 tensor.data()[1],
@@ -868,10 +1497,28 @@ impl Weights {
         let (cq, ck, cv, cbq, cbk, cbv) = split("context_attention")?;
         let (aq, ak, av, abq, abk, abv) = split("audio_attention")?;
 
+        // [c][ic][k] -> [c][k][ic]: each output channel's 5 taps become a
+        // contiguous [5, in] block so interior im2col rows are a memcpy.
+        let prepack_conv = |raw: &[f32], out: usize, inc: usize| -> Vec<f32> {
+            let mut packed = vec![0.0f32; out * 5 * inc];
+            for c in 0..out {
+                for k in 0..5 {
+                    for ic in 0..inc {
+                        packed[c * 5 * inc + k * inc + ic] = raw[(c * inc + ic) * 5 + k];
+                    }
+                }
+            }
+            packed
+        };
+        let conv1_raw = get("audio.0.weight", &[dim, FEATURE_DIM, 5])?;
+        let conv2_raw = get("audio.2.weight", &[dim, dim, 5])?;
+        let conv1_w = prepack_conv(&conv1_raw, dim, FEATURE_DIM);
+        let conv2_w = prepack_conv(&conv2_raw, dim, dim);
+
         Ok(Self {
-            conv1_w: get("audio.0.weight", &[dim, FEATURE_DIM, 5])?,
+            conv1_w,
             conv1_b: get("audio.0.bias", &[dim])?,
-            conv2_w: get("audio.2.weight", &[dim, dim, 5])?,
+            conv2_w,
             conv2_b: get("audio.2.bias", &[dim])?,
             ctx_w: get("context_projection.weight", &[dim, qwen])?,
             ctx_b: get("context_projection.bias", &[dim])?,
@@ -971,6 +1618,18 @@ fn mel_filterbank() -> Vec<f32> {
     bank
 }
 
+fn mel_active_ranges(bank: &[f32]) -> Vec<(usize, usize)> {
+    let bins = N_FFT / 2 + 1;
+    (0..N_MELS)
+        .map(|m| {
+            let row = &bank[m * bins..(m + 1) * bins];
+            let start = row.iter().position(|v| *v != 0.0).unwrap_or(bins);
+            let end = row.iter().rposition(|v| *v != 0.0).map_or(start, |i| i + 1);
+            (start, end)
+        })
+        .collect()
+}
+
 /// `_band_edges`: four contiguous bands over the 257 rfft bins.
 fn band_edges(bins: usize) -> [usize; SPECTRAL_BANDS + 1] {
     let mut edges = [0usize; SPECTRAL_BANDS + 1];
@@ -1003,59 +1662,16 @@ fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32]) {
     }
 }
 
-fn softmax(scores: &[f32]) -> Vec<f32> {
+fn softmax_in_place(scores: &mut [f32]) {
     let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut out: Vec<f32> = scores.iter().map(|v| (v - max).exp()).collect();
-    let total: f32 = out.iter().sum();
-    out.iter_mut().for_each(|v| *v /= total);
-    out
-}
-
-fn softmax_scaled(scores: &[f32], temperature: f32) -> Vec<f32> {
-    let scaled: Vec<f32> = scores.iter().map(|v| v / temperature).collect();
-    softmax(&scaled)
-}
-
-/// One query against `n` keys, all heads; returns the concatenated head output
-/// (before `out_proj`).  `mask[r] == 0.0` removes key `r`.
-fn attention(
-    query: &[f32],
-    keys: &[Vec<f32>],
-    values: &[Vec<f32>],
-    mask: Option<&ContextMask>,
-    dim: usize,
-    heads: usize,
-) -> Vec<f32> {
-    let head_dim = dim / heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0.0f32; dim];
-    let n = keys.len();
-    for h in 0..heads {
-        let q = &query[h * head_dim..(h + 1) * head_dim];
-        let mut scores = vec![0.0f32; n];
-        for r in 0..n {
-            let k = &keys[r][h * head_dim..(h + 1) * head_dim];
-            let mut acc = 0.0f32;
-            for d in 0..head_dim {
-                acc += q[d] * k[d];
-            }
-            scores[r] = acc * scale;
-            if let Some(mask) = mask {
-                if mask[r] == 0.0 {
-                    scores[r] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        let p = softmax(&scores);
-        for d in 0..head_dim {
-            let mut acc = 0.0f32;
-            for r in 0..n {
-                acc += p[r] * values[r][h * head_dim + d];
-            }
-            out[h * head_dim + d] = acc;
-        }
+    let mut total = 0.0f32;
+    for v in scores.iter_mut() {
+        *v = (*v - max).exp();
+        total += *v;
     }
-    out
+    for v in scores.iter_mut() {
+        *v /= total;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1817,161 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // local fast-path equivalence tests
+    // ---------------------------------------------------------------------
+
+    /// A head with a real normalizer/bank/FFT but zero weights — sufficient
+    /// for feature extraction tests, which don't touch the network weights.
+    fn synth_head() -> LocalHead {
+        let mut planner = rustfft::FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(N_FFT);
+        let fft_scratch_len = fft.get_inplace_scratch_len();
+        let bank = mel_filterbank();
+        let mel_ranges = mel_active_ranges(&bank);
+        let dim = 128;
+        let zeros = |n: usize| vec![0.0f32; n];
+        LocalHead {
+            weights: Weights {
+                conv1_w: zeros(dim * FEATURE_DIM * 5),
+                conv1_b: zeros(dim),
+                conv2_w: zeros(dim * dim * 5),
+                conv2_b: zeros(dim),
+                ctx_w: zeros(dim * 1024),
+                ctx_b: zeros(dim),
+                role: zeros(4 * dim),
+                endpoint: zeros(2 * dim),
+                cq: zeros(dim * dim),
+                ck: zeros(dim * dim),
+                cv: zeros(dim * dim),
+                cbq: zeros(dim),
+                cbk: zeros(dim),
+                cbv: zeros(dim),
+                co_w: zeros(dim * dim),
+                co_b: zeros(dim),
+                aq: zeros(dim * dim),
+                ak: zeros(dim * dim),
+                av: zeros(dim * dim),
+                abq: zeros(dim),
+                abk: zeros(dim),
+                abv: zeros(dim),
+                ao_w: zeros(dim * dim),
+                ao_b: zeros(dim),
+                qn_w: vec![1.0; dim],
+                qn_b: zeros(dim),
+                an_w: vec![1.0; dim],
+                an_b: zeros(dim),
+                act_w: zeros(dim),
+                act_b: 0.0,
+                bnd_w: zeros(dim),
+                bnd_b: 0.0,
+                derivative_scale: 0.5,
+                prior: canonical_prior(),
+                model_dim: dim,
+                heads: 4,
+                context_in: 1024,
+            },
+            mean: vec![0.0; FEATURE_DIM],
+            std: vec![1.0; FEATURE_DIM],
+            fft,
+            hann: hann_window(FRAME_MS * SAMPLE_RATE / 1000),
+            bank,
+            mel_ranges,
+            fft_scratch_len,
+        }
+    }
+
+    #[test]
+    fn global_features_match_features_one() {
+        let head = synth_head();
+        // ~0.5 s of deterministic pseudo-audio, enough for boundary frames.
+        let samples: Vec<f32> = (0..8_000)
+            .map(|i| ((i * 7919 % 4093) as f32 / 4093.0 - 0.5) * 0.2)
+            .collect();
+        let centers: Vec<i64> = vec![
+            0,  // leading boundary
+            10, // overlapping with the next
+            20, 80,  // coarse grid
+            320, // interior
+            480, // near the end of audio (500 ms)
+        ];
+        let global = head.features(&samples, &centers);
+        let mut worst = 0.0f32;
+        for (k, &center) in centers.iter().enumerate() {
+            let mut one = vec![0.0f32; FRAME_COUNT * FEATURE_DIM];
+            head.features_one(&samples, center, &mut one);
+            let got = &global[k * FRAME_COUNT * FEATURE_DIM..(k + 1) * FRAME_COUNT * FEATURE_DIM];
+            for (a, b) in one.iter().zip(got) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        eprintln!("global vs one feature max |diff| = {worst:.3e}");
+        assert!(worst < 1e-5, "global features diverge: {worst}");
+        assert!(head.features(&samples, &[]).is_empty());
+    }
+
+    #[test]
+    fn off_grid_centers_fall_back_to_features_one() {
+        let head = synth_head();
+        let samples: Vec<f32> = (0..8_000)
+            .map(|i| ((i * 104729 % 4093) as f32 / 4093.0 - 0.5) * 0.2)
+            .collect();
+        // 15 ms is off the 10 ms grid; the fallback path must be used.
+        let centers = [15i64, 105, 255];
+        let got = head.features(&samples, &centers);
+        for (k, &center) in centers.iter().enumerate() {
+            let mut one = vec![0.0f32; FRAME_COUNT * FEATURE_DIM];
+            head.features_one(&samples, center, &mut one);
+            assert_eq!(
+                got[k * FRAME_COUNT * FEATURE_DIM..(k + 1) * FRAME_COUNT * FEATURE_DIM],
+                one,
+                "off-grid center {center}"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_refine_matches_single_endpoint_offset() {
+        let Some(g) = golden() else { return };
+        let samples = f32_file(
+            &g.dir
+                .join(g.meta["audio_file"].as_str().expect("audio_file")),
+        );
+        let logits = f32_file(
+            &g.dir
+                .join(g.meta["logits_file"].as_str().expect("logits_file")),
+        );
+        let hidden = f32_file(
+            &g.dir
+                .join(g.meta["hidden_file"].as_str().expect("hidden_file")),
+        );
+        let n_labels = g.meta["num_labels"].as_u64().expect("num_labels") as usize;
+        let hidden_size = g.meta["hidden_shape"][0].as_u64().expect("hidden") as usize;
+        let slots = hidden.len() / hidden_size;
+        let duration_ms = samples.len() as f64 * 1000.0 / SAMPLE_RATE as f64;
+        let valid = valid_class_count(duration_ms, n_labels);
+        let raw: Vec<i64> = (0..slots)
+            .map(|s| argmax_ms(&logits[s * n_labels..s * n_labels + valid]))
+            .collect();
+        let fixed = fix_timestamps(&raw);
+        let (context, masks) = g.head.context_rows(&hidden, hidden_size, slots / 2);
+        let features = g.head.features(&samples, &fixed);
+
+        // Compare `refine_offsets` (pre-projected unique slot/word-mean GEMM)
+        // against the per-endpoint `context_rows` + `endpoint_offset` path.
+        let batched = g.head.refine_offsets(&features, &hidden, hidden_size, slots / 2);
+        let mut worst = 0.0f32;
+        for e in 0..slots {
+            let feat =
+                &features[e * FRAME_COUNT * FEATURE_DIM..(e + 1) * FRAME_COUNT * FEATURE_DIM];
+            let ctx = &context[e * 4 * hidden_size..(e + 1) * 4 * hidden_size];
+            let single = g.head.endpoint_offset(feat, ctx, &masks[e], e % 2);
+            worst = worst.max((single - batched[e]).abs());
+        }
+        eprintln!("batched vs single endpoint max |diff| = {worst:.3e} ms");
+        assert!(worst < 1e-4, "batched offsets diverge: {worst} ms");
+    }
+
+    // ---------------------------------------------------------------------
     // parity against the python reference
     //
     // `tools/gold/local_head/15s_en.*` is the frozen python run (gitignored,
@@ -1261,9 +2032,18 @@ mod tests {
     #[test]
     fn features_match_python_golden() {
         let Some(g) = golden() else { return };
-        let samples = f32_file(&g.dir.join(g.meta["audio_file"].as_str().expect("audio_file")));
-        assert_eq!(samples.len(), g.meta["audio_samples"].as_u64().expect("len") as usize);
-        let fixed: Vec<i64> = nums(&g.meta, "fixed_ms").iter().map(|v| *v as i64).collect();
+        let samples = f32_file(
+            &g.dir
+                .join(g.meta["audio_file"].as_str().expect("audio_file")),
+        );
+        assert_eq!(
+            samples.len(),
+            g.meta["audio_samples"].as_u64().expect("len") as usize
+        );
+        let fixed: Vec<i64> = nums(&g.meta, "fixed_ms")
+            .iter()
+            .map(|v| *v as i64)
+            .collect();
         let all = g.head.features(&samples, &fixed);
 
         let sample: Vec<usize> = g.meta["sample_endpoints"]
@@ -1277,7 +2057,8 @@ mod tests {
 
         let mut worst = 0.0f32;
         for (k, &endpoint) in sample.iter().enumerate() {
-            let got = &all[endpoint * FRAME_COUNT * FEATURE_DIM..(endpoint + 1) * FRAME_COUNT * FEATURE_DIM];
+            let got = &all
+                [endpoint * FRAME_COUNT * FEATURE_DIM..(endpoint + 1) * FRAME_COUNT * FEATURE_DIM];
             let row = want[k].as_array().expect("row");
             assert_eq!(row.len(), got.len());
             for (i, v) in row.iter().enumerate() {
@@ -1322,18 +2103,33 @@ mod tests {
             let got = g.head.endpoint_offset(&feat, &ctx, &m, e);
             let want = offsets[index] as f32;
             worst = worst.max((got - want).abs());
-            eprintln!("endpoint {index:3} ({e}): rust {got:9.4}  python {want:9.4}  d {:.4}", got - want);
+            eprintln!(
+                "endpoint {index:3} ({e}): rust {got:9.4}  python {want:9.4}  d {:.4}",
+                got - want
+            );
         }
         eprintln!("offset max |diff| = {worst:.4} ms");
-        assert!(worst < 0.05, "head offsets diverge from the reference: {worst} ms");
+        assert!(
+            worst < 0.05,
+            "head offsets diverge from the reference: {worst} ms"
+        );
     }
 
     #[test]
     fn refine_matches_python_golden() {
         let Some(g) = golden() else { return };
-        let samples = f32_file(&g.dir.join(g.meta["audio_file"].as_str().expect("audio_file")));
-        let logits = f32_file(&g.dir.join(g.meta["logits_file"].as_str().expect("logits_file")));
-        let hidden = f32_file(&g.dir.join(g.meta["hidden_file"].as_str().expect("hidden_file")));
+        let samples = f32_file(
+            &g.dir
+                .join(g.meta["audio_file"].as_str().expect("audio_file")),
+        );
+        let logits = f32_file(
+            &g.dir
+                .join(g.meta["logits_file"].as_str().expect("logits_file")),
+        );
+        let hidden = f32_file(
+            &g.dir
+                .join(g.meta["hidden_file"].as_str().expect("hidden_file")),
+        );
         let n_labels = g.meta["num_labels"].as_u64().expect("num_labels") as usize;
         let hidden_size = g.meta["hidden_shape"][0].as_u64().expect("hidden") as usize;
         let words: Vec<String> = g.meta["words"]
@@ -1357,12 +2153,19 @@ mod tests {
                 let want_v = want[i][key].as_f64().expect("time");
                 let d = (got - want_v).abs() * 1000.0;
                 if d > 0.5 {
-                    eprintln!("word {i:2} {:12} {:>5}: rust {got:.4}  python {want_v:.4}  d {d:.3} ms", item.text, ["start", "end"][key - 1]);
+                    eprintln!(
+                        "word {i:2} {:12} {:>5}: rust {got:.4}  python {want_v:.4}  d {d:.3} ms",
+                        item.text,
+                        ["start", "end"][key - 1]
+                    );
                 }
                 worst = worst.max(d);
             }
         }
         eprintln!("refine max |diff| = {worst:.4} ms");
-        assert!(worst < 0.5, "refined intervals diverge from the reference: {worst} ms");
+        assert!(
+            worst < 0.5,
+            "refined intervals diverge from the reference: {worst} ms"
+        );
     }
 }
