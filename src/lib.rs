@@ -52,6 +52,9 @@ pub mod shaders;
 pub mod weights;
 pub mod words;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod cblas;
+
 pub use gpu::{list_devices, Backend, DeviceInfo, DeviceSelector, Gpu};
 pub use mel::load_audio_wav;
 pub use postprocess::{decode_timestamps, fix_timestamps, AlignItem};

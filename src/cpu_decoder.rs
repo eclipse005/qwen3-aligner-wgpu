@@ -584,6 +584,31 @@ fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: 
     debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(x.len(), m * k);
     debug_assert_eq!(w.len(), n * k);
+    // Prefill-sized batches: Accelerate's sgemm is materially faster than the
+    // portable kernel on Apple Silicon.  `m == 1` (decode) stays on the
+    // hand-rolled path, where the per-call thread spawn would dominate.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        if m >= 16 && n > 0 && k > 0 {
+            unsafe {
+                crate::cblas::sgemm_rm(
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    x.as_ptr(),
+                    k,
+                    true,
+                    w.as_ptr(),
+                    k,
+                    beta,
+                    out.as_mut_ptr(),
+                    n,
+                );
+            }
+            return;
+        }
+    }
     unsafe {
         gemm::gemm(
             m,
