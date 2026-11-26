@@ -1861,7 +1861,7 @@ fn prefill_gemm_impl(
 
     let mut s = String::new();
     s.push_str(
-        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32 };\n\
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32, gqa_group: u32, _pad: u32 };\n\
          @group(0) @binding(0) var<storage, read>       A: array<u32>;\n\
          @group(0) @binding(1) var<storage, read>       W: array<u32>;\n\
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
@@ -1901,7 +1901,7 @@ fn prefill_gemm_impl(
          let tx = lid.x;\n let ty = lid.y;\n\
          let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / 2u;\n\
          let alda = gd.lda / 2u;\n\
-         let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
+         let abase = wid.z * gd.bsa;\n let wb = (wid.z / max(gd.gqa_group, 1u)) * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
          if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) { return; }\n\
          let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",

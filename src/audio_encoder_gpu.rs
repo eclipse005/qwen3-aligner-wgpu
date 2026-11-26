@@ -47,6 +47,8 @@ const TAPS: usize = 9;
 const MAX_TOKENS: usize = 16384;
 /// Largest attention window: `feo(100) · n_window_infer/100` = 1250.
 const MAX_WINDOW: usize = 2048;
+/// Uniform slots for one conv round: 3 im2col + gemm + gelu, plus permute.
+const MAX_CONV_ROUNDS: usize = 32;
 /// Uniform ring for per-dispatch `GDims` (256 B slots, dynamic offset).
 /// 256 slots = 64 KiB, this stack's `max_uniform_buffer_binding_size`.
 const MAX_GEMMS: usize = 256;
@@ -90,6 +92,8 @@ struct GDims {
     row0: u32,
     /// A row stride in elements; `k` for every tower GEMM.
     lda: u32,
+    gqa_group: u32,
+    _pad: u32,
 }
 
 /// Mirrors `shaders::audio_im2col`'s `Im2Cfg` field for field.
@@ -610,6 +614,8 @@ pub struct GpuAudioEncoder {
     /// Diagnostic: snapshot `h` inside layer 0 (between attention and FFN).
     mid_capture: std::cell::Cell<bool>,
     mid_h: std::cell::RefCell<Option<Vec<f16>>>,
+
+    scratch: Option<EncScratch>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -692,6 +698,34 @@ impl EncSkip {
     }
 }
 
+/// Grow-only per-encode scratch.  Uniforms are allocated once; clip-sized
+/// buffers grow only when a longer mel arrives.
+struct EncScratch {
+    cap_mel_bytes: u64,
+    mel_buf: wgpu::Buffer,
+    cap_s_pad: usize,
+    packed: wgpu::Buffer,
+    h_raw: wgpu::Buffer,
+    h_buf: wgpu::Buffer,
+    normed: wgpu::Buffer,
+    norm2: wgpu::Buffer,
+    qkv: wgpu::Buffer,
+    q_buf: wgpu::Buffer,
+    k_buf: wgpu::Buffer,
+    v_buf: wgpu::Buffer,
+    attn_flat: wgpu::Buffer,
+    gu: wgpu::Buffer,
+    gact: wgpu::Buffer,
+    out_emb: wgpu::Buffer,
+    cap_z_blocks: usize,
+    qp: wgpu::Buffer,
+    kt: wgpu::Buffer,
+    vp: wgpu::Buffer,
+    scores: wgpu::Buffer,
+    attn: wgpu::Buffer,
+    attn_out: wgpu::Buffer,
+}
+
 /// Per-pass activation buffers, sized to this clip.
 struct LayerCtx<'a> {
     geom: Geom,
@@ -717,6 +751,76 @@ struct LayerCtx<'a> {
     attn_out: &'a wgpu::Buffer,
     /// Ablation state — see [`EncSkip`].
     skip: &'a EncSkip,
+}
+
+impl EncScratch {
+    fn new(gpu: &Gpu) -> Self {
+        let storage = |label: &str| gpu.storage(label, 16);
+        Self {
+            cap_mel_bytes: 0, mel_buf: storage("enc.mel"),
+            cap_s_pad: 0,
+            packed: storage("enc.packed"), h_raw: storage("enc.h_raw"), h_buf: storage("enc.h"),
+            normed: storage("enc.normed"), norm2: storage("enc.norm2"), qkv: storage("enc.qkv"),
+            q_buf: storage("enc.q"), k_buf: storage("enc.k"), v_buf: storage("enc.v"),
+            attn_flat: storage("enc.attn_flat"), gu: storage("enc.gu"), gact: storage("enc.gact"),
+            out_emb: storage("enc.out"),
+            cap_z_blocks: 0,
+            qp: storage("enc.qp"), kt: storage("enc.kt"), vp: storage("enc.vp"),
+            scores: storage("enc.scores"), attn: storage("enc.attn"), attn_out: storage("enc.attn_out"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure(
+        &mut self,
+        gpu: &Gpu,
+        mel_bytes: u64,
+        s_pad: usize,
+        z_blocks: usize,
+        words: &impl Fn(usize) -> u64,
+        (cf, dm, qkv_cols, acols, gu_pad, inter_pad, out_dim, wpad, hd, hd_pad):
+            (usize, usize, usize, usize, usize, usize, usize, usize, usize, usize),
+    ) {
+        if mel_bytes > self.cap_mel_bytes {
+            self.mel_buf = gpu.storage("enc.mel", mel_bytes);
+            self.cap_mel_bytes = mel_bytes;
+        }
+        if s_pad > self.cap_s_pad {
+            let token: [(&str, &mut wgpu::Buffer, u64); 13] = [
+                ("enc.packed", &mut self.packed, words(s_pad * cf)),
+                ("enc.h_raw", &mut self.h_raw, words(s_pad * dm)),
+                ("enc.h", &mut self.h_buf, words(s_pad * dm)),
+                ("enc.normed", &mut self.normed, words(s_pad * dm)),
+                ("enc.norm2", &mut self.norm2, words(s_pad * dm)),
+                ("enc.qkv", &mut self.qkv, words(s_pad * qkv_cols)),
+                ("enc.q", &mut self.q_buf, words(s_pad * acols)),
+                ("enc.k", &mut self.k_buf, words(s_pad * acols)),
+                ("enc.v", &mut self.v_buf, words(s_pad * acols)),
+                ("enc.attn_flat", &mut self.attn_flat, words(s_pad * acols)),
+                ("enc.gu", &mut self.gu, words(s_pad * gu_pad)),
+                ("enc.gact", &mut self.gact, words(s_pad * inter_pad)),
+                ("enc.out", &mut self.out_emb, words(s_pad * out_dim)),
+            ];
+            for (label, buf, need) in token {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_s_pad = s_pad;
+        }
+        if z_blocks > self.cap_z_blocks {
+            let win: [(&str, &mut wgpu::Buffer, u64); 6] = [
+                ("enc.qp", &mut self.qp, (z_blocks * wpad * hd * 2) as u64),
+                ("enc.kt", &mut self.kt, (z_blocks * hd * wpad * 2) as u64),
+                ("enc.vp", &mut self.vp, (z_blocks * wpad * hd_pad * 2) as u64),
+                ("enc.scores", &mut self.scores, (z_blocks * wpad * wpad * 2) as u64),
+                ("enc.attn", &mut self.attn, (z_blocks * wpad * wpad * 2) as u64),
+                ("enc.attn_out", &mut self.attn_out, (z_blocks * wpad * hd_pad * 2) as u64),
+            ];
+            for (label, buf, need) in win {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_z_blocks = z_blocks;
+        }
+    }
 }
 
 impl GpuAudioEncoder {
@@ -752,7 +856,7 @@ impl GpuAudioEncoder {
         // The layernorm stages one row in workgroup memory (`AUDIO_LN_WORDS`
         // 16-bit pairs), so the tower's width has to fit it.
         anyhow::ensure!(
-            cfg.d_model as usize <= 2 * shaders::AUDIO_LN_WORDS,
+            cfg.d_model <= 2 * shaders::AUDIO_LN_WORDS,
             "audio d_model {} exceeds the layernorm staging ({} words)",
             cfg.d_model,
             shaders::AUDIO_LN_WORDS
@@ -893,22 +997,24 @@ impl GpuAudioEncoder {
         // Conv GEMMs read the weight as `A` and the im2col operand as `B`
         // (`transb`), so they share one pipeline; everything else uses the plain
         // `[m,k]`×`[n,k]` form.
-        let gemm_layout = gemm_layout(gpu, "enc_gemm", 3, &[2]);
+        let enc_gemm_layout = gemm_layout(gpu, "enc_gemm", 3, &[2]);
+        let im_layout = gemm_layout(gpu, "enc_im2col", 3, &[2]);
+        let pm_layout = gemm_layout(gpu, "enc_permute", 2, &[1]);
         // A bias needs a storage binding *after* the dynamic-offset uniform.
         let gemm_bias_layout = gemm_bias_layout(gpu, "enc_gemm_bias", &[2]);
         let jobs = [
-            PipeJob::new("enc_im2col", shaders::audio_im2col(), "im2col", None),
+            PipeJob::new("enc_im2col", shaders::audio_im2col(), "im2col", Some(&im_layout)),
             PipeJob::new("enc_gelu", shaders::audio_bias_gelu(), "bias_gelu", None),
-            PipeJob::new("enc_gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_layout)),
-            PipeJob::new("enc_gemm_t", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_layout)),
+            PipeJob::new("enc_gemm", shaders::prefill_gemm(false, false), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm_t", shaders::prefill_gemm(true, false), "gemm", Some(&enc_gemm_layout)),
             PipeJob::new("enc_extract", shaders::audio_extract_qkv(), "extract", None),
             PipeJob::new("enc_win_pack", shaders::audio_win_pack(), "win_pack", None),
-            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_layout)),
+            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm(false, true), "gemm", Some(&enc_gemm_layout)),
             PipeJob::new("enc_gemm_bias", shaders::prefill_gemm_bias(false, false), "gemm", Some(&gemm_bias_layout)),
             PipeJob::new("enc_gemm_beta_bias", shaders::prefill_gemm_bias(false, true), "gemm", Some(&gemm_bias_layout)),
             PipeJob::new("enc_softmax", shaders::audio_window_softmax(), "softmax", None),
             PipeJob::new("enc_layernorm", shaders::audio_layernorm(), "layernorm", None),
-            PipeJob::new("enc_permute", shaders::audio_permute_pe(), "permute_pe", None),
+            PipeJob::new("enc_permute", shaders::audio_permute_pe(), "permute_pe", Some(&pm_layout)),
             PipeJob::new("enc_add_pe", shaders::audio_add_pe(), "add_pe", None),
             PipeJob::new("enc_attn_flat", shaders::audio_attn_flat(), "attn_flat", None),
         ];
@@ -958,9 +1064,9 @@ impl GpuAudioEncoder {
 
         let u_gd = up.uniform("enc.gd", (MAX_GEMMS * 256) as u64);
         let u_im = [
-            up.uniform("enc.im0", 48),
-            up.uniform("enc.im1", 48),
-            up.uniform("enc.im2", 48),
+            up.uniform("enc.im0", (MAX_CONV_ROUNDS * 256) as u64),
+            up.uniform("enc.im1", (MAX_CONV_ROUNDS * 256) as u64),
+            up.uniform("enc.im2", (MAX_CONV_ROUNDS * 256) as u64),
         ];
         let u_sc = [
             up.uniform("enc.sc.c1", 32),
@@ -972,7 +1078,7 @@ impl GpuAudioEncoder {
         let u_ex = up.uniform("enc.ex", 32);
         let u_sm = up.uniform("enc.sm", 32);
         let u_ln = up.uniform("enc.ln", 32);
-        let u_pm = up.uniform("enc.pm", 32);
+        let u_pm = up.uniform("enc.pm", (MAX_CONV_ROUNDS * 256) as u64);
         let u_pe = up.uniform("enc.pe_cfg", 32);
         let u_wp = up.uniform("enc.win_cfg", 32);
         let u_cp = up.uniform("enc.cp", 32);
@@ -1018,6 +1124,7 @@ impl GpuAudioEncoder {
             gd_slot: std::cell::Cell::new(0),
             mid_capture: std::cell::Cell::new(false),
             mid_h: std::cell::RefCell::new(None),
+            scratch: None,
         })
     }
 
@@ -1092,7 +1199,7 @@ impl GpuAudioEncoder {
         let mel16: Vec<f16> = chunked.iter().map(|v| f16::from_f32(*v)).collect();
         let t_pack = t_pack.elapsed();
 
-        // ── clip-sized buffers ──
+        // ── clip-sized buffers: grow once, then reuse across encodes ──
         let (dm, nh, hd, inter, acols) = (self.d_model, self.nh, self.hd, self.inter, self.attn_cols);
         let out_dim = self.out_dim;
         let cf = self.conv_out.k;
@@ -1104,33 +1211,27 @@ impl GpuAudioEncoder {
         let n_win = n_total.div_ceil(wlen);
         let geom = Geom { n_chunks, s: n_total, wlen, n_win, s_win: n_win * wlen };
         let words = |n: usize| (n / 2 * 4) as u64;
-
-        let mel_buf = gpu.storage("enc.mel", (mel16.len() * 2) as u64);
-        gpu.upload(&mel_buf, &weights::words_bytes(&mel16));
-        let packed = gpu.storage("enc.packed", words(s_pad * cf));
-        let h_raw = gpu.storage("enc.h_raw", words(s_pad * dm));
-        let h_buf = gpu.storage("enc.h", words(s_pad * dm));
-        let normed = gpu.storage("enc.normed", words(s_pad * dm));
-        let norm2 = gpu.storage("enc.norm2", words(s_pad * dm));
-        let qkv = gpu.storage("enc.qkv", words(s_pad * qkv_cols));
-        let q_buf = gpu.storage("enc.q", words(s_pad * acols));
-        let k_buf = gpu.storage("enc.k", words(s_pad * acols));
-        let v_buf = gpu.storage("enc.v", words(s_pad * acols));
-        let attn_flat = gpu.storage("enc.attn_flat", words(s_pad * acols));
-        // Per-(head, window) attention blocks.  `wpad` is the GEMM tile
-        // `wlen` is rounded up to, and `hd_pad` the `n` tile `hd` is.
+        // Per-(head, window) attention blocks: `wpad` rounds `wlen` up to the
+        // GEMM's `m` tile and `hd_pad` rounds `hd` up to its `n` tile.
         let wpad = align(wlen, GEMM_BM);
         let hd_pad = align(hd, GEMM_BN);
         let z_blocks = nh * n_win;
-        let qp = gpu.storage("enc.qp", (z_blocks * wpad * hd * 2) as u64);
-        let kt = gpu.storage("enc.kt", (z_blocks * hd * wpad * 2) as u64);
-        let vp = gpu.storage("enc.vp", (z_blocks * wpad * hd_pad * 2) as u64);
-        let scores = gpu.storage("enc.scores", (z_blocks * wpad * wpad * 2) as u64);
-        let attn = gpu.storage("enc.attn", (z_blocks * wpad * wpad * 2) as u64);
-        let attn_out = gpu.storage("enc.attn_out", (z_blocks * wpad * hd_pad * 2) as u64);
-        let gu = gpu.storage("enc.gu", words(s_pad * gu_pad));
-        let gact = gpu.storage("enc.gact", words(s_pad * inter_pad));
-        let out_emb = gpu.storage("enc.out", words(s_pad * out_dim));
+        let sc = self.scratch.get_or_insert_with(|| EncScratch::new(gpu));
+        sc.ensure(
+            gpu, (mel16.len() * 2) as u64, s_pad, z_blocks, &words,
+            (cf, dm, qkv_cols, acols, gu_pad, inter_pad, out_dim, wpad, hd, hd_pad),
+        );
+        let EncScratch {
+            mel_buf, packed, h_raw, h_buf, normed, norm2, qkv, q_buf, k_buf, v_buf,
+            attn_flat, gu, gact, out_emb, qp, kt, vp, scores, attn, attn_out, ..
+        } = &*sc;
+        let (mel_buf, packed, h_raw, h_buf, normed, norm2, qkv) =
+            (mel_buf.clone(), packed.clone(), h_raw.clone(), h_buf.clone(), normed.clone(), norm2.clone(), qkv.clone());
+        let (q_buf, k_buf, v_buf, attn_flat, gu, gact, out_emb) =
+            (q_buf.clone(), k_buf.clone(), v_buf.clone(), attn_flat.clone(), gu.clone(), gact.clone(), out_emb.clone());
+        let (qp, kt, vp, scores, attn, attn_out) =
+            (qp.clone(), kt.clone(), vp.clone(), scores.clone(), attn.clone(), attn_out.clone());
+        gpu.upload(&mel_buf, &weights::words_bytes(&mel16));
 
         // The FFN and projection GELU shapes depend on the clip's token count.
         for (i, (rows, lin, by_channel)) in [
@@ -1162,14 +1263,25 @@ impl GpuAudioEncoder {
         // and the transformer can be priced against the same list.
         let skip = EncSkip::from_env();
 
-        // ── conv stem: `CONV_TILE` chunks per round, one submit each ──
-        // Each round must be its own submit: `u_im`/`u_pm` carry per-round
-        // values, and wgpu applies a `write_buffer` at the next submit.
+        // ── conv stem: `CONV_TILE` chunks per round ──
+        // Per-round cfg slots (`u_im`, `u_pm`, and three `u_gd` GEMMs) let many
+        // rounds share one command buffer; only a wrap waits for the GPU.
         let mut ch0 = 0usize;
+        let mut round_slot = 0usize;
+        if !capture { self.gd_slot.set(0); }
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
         while ch0 < n_chunks {
             let n = CONV_TILE.min(n_chunks - ch0);
-            self.gd_slot.set(0);
-            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            if !capture && (round_slot >= MAX_CONV_ROUNDS || self.gd_slot.get() + 3 > MAX_GEMMS) {
+                gpu.queue.submit([enc.finish()]);
+                gpu.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost in conv wrap at chunk {ch0}: {e:?}"))?;
+                enc = gpu.device.create_command_encoder(&Default::default());
+                round_slot = 0;
+                self.gd_slot.set(0);
+            }
+            if capture { self.gd_slot.set(0); round_slot = 0; }
             for level in 0..3 {
                 let (input, cin0) = if level == 0 {
                     (&mel_buf, ch0)
@@ -1177,7 +1289,7 @@ impl GpuAudioEncoder {
                     (&self.act[level - 1], 0)
                 };
                 if !skip.matches("im2col") {
-                    self.im2col(gpu, &mut enc, level, input, cin0, n);
+                    self.im2col(gpu, &mut enc, level, input, cin0, n, round_slot);
                 }
                 if !skip.matches("cgemm") {
                     self.gemm_conv(gpu, &mut enc, level);
@@ -1187,24 +1299,29 @@ impl GpuAudioEncoder {
                 }
             }
             if !skip.matches("permute") {
-                self.permute(gpu, &mut enc, &packed, ch0, n_total, tpc, cf);
+                self.permute(gpu, &mut enc, &packed, ch0, n_total, tpc, cf, round_slot);
             }
             if capture {
                 self.capture_round(gpu, &mut enc, &mut out, ch0, n, &mel_buf)?;
-            } else {
-                gpu.queue.submit([enc.finish()]);
-                gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost in conv round {ch0}: {e:?}"))?;
             }
+            round_slot += 1;
             ch0 += n;
         }
 
         // ── conv_out + PE ──
-        // Its own submit: the transformer's first `out_proj` GEMM writes into
-        // the residual buffer, so `h` must be read back before it runs.
-        self.gd_slot.set(0);
-        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        // The transformer's first `out_proj` GEMM writes into the residual
+        // buffer, so a capture must read `h` before that runs.  Normal encodes
+        // keep the same `gd_slot` (no reset) so in-flight submissions never
+        // have a uniform slot overwritten under them.
+        if !capture && self.gd_slot.get() + 1 > MAX_GEMMS {
+            gpu.queue.submit([enc.finish()]);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("audio encoder: device lost before conv_out: {e:?}"))?;
+            enc = gpu.device.create_command_encoder(&Default::default());
+            self.gd_slot.set(0);
+        }
+        if capture { self.gd_slot.set(0); }
         if !skip.matches("convout") {
             self.gemm(
                 gpu, &mut enc, &packed, &self.conv_out.w, &h_raw,
@@ -1215,16 +1332,16 @@ impl GpuAudioEncoder {
             self.add_pe(gpu, &mut enc, &h_raw, &h_buf, s_pad);
         }
         gpu.queue.submit([enc.finish()]);
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("audio encoder: device lost after conv_out: {e:?}"))?;
         if capture {
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("audio encoder: device lost after conv_out: {e:?}"))?;
             out.h = read_f16_buf(gpu, &h_buf, s_pad * dm)?;
         }
 
         // ── transformer + projections ──
         self.mid_capture.set(capture);
-        self.gd_slot.set(0);
+        if capture { self.gd_slot.set(0); }
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let ctx = LayerCtx {
             geom,
@@ -1250,6 +1367,14 @@ impl GpuAudioEncoder {
             skip: &skip,
         };
         for li in 0..self.layers.len() {
+            if !capture && self.gd_slot.get() + 6 > MAX_GEMMS {
+                gpu.queue.submit([enc.finish()]);
+                gpu.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost before layer {li}: {e:?}"))?;
+                enc = gpu.device.create_command_encoder(&Default::default());
+                self.gd_slot.set(0);
+            }
             self.layer(gpu, &mut enc, &ctx, li)?;
             if capture {
                 // One submit per layer: a layer's output is overwritten by the
@@ -1297,13 +1422,18 @@ impl GpuAudioEncoder {
             // `QALIGN_ENC_SKIP=<every group>` prices at 49.1 ms on 180s_zh.
             if !capture && (li + 1) < self.layers.len() && (li + 1) % SUBMIT_EVERY == 0 {
                 gpu.queue.submit([enc.finish()]);
-                gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}"))?;
                 enc = gpu.device.create_command_encoder(&Default::default());
             }
         }
         // ── ln_post + projector ──
+        if !capture && self.gd_slot.get() + 2 > MAX_GEMMS {
+            gpu.queue.submit([enc.finish()]);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("audio encoder: device lost before projector: {e:?}"))?;
+            enc = gpu.device.create_command_encoder(&Default::default());
+            self.gd_slot.set(0);
+        }
         if !skip.matches("lnpost") {
             self.layernorm(gpu, &mut enc, ctx.h, &self.ln_post, ctx.normed, geom.s);
         }
@@ -1730,11 +1860,12 @@ impl GpuAudioEncoder {
         input: &wgpu::Buffer,
         cin0: usize,
         n_chunks_round: usize,
+        round_slot: usize,
     ) {
         let l = &self.conv[level];
         gpu.queue.write_buffer(
             &self.u_im[level],
-            0,
+            (round_slot * 256) as u64,
             bytemuck::bytes_of(&Im2Cfg {
                 taps: TAPS as u32,
                 k: l.k as u32,
@@ -1757,12 +1888,19 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: l.taps.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.col[level].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.u_im[level].as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.u_im[level],
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(64),
+                    }),
+                },
             ],
         });
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.im2col);
-        cp.set_bind_group(0, &bg, &[]);
+        cp.set_bind_group(0, &bg, &[(round_slot * 256) as u32]);
         // x: 32-position blocks (16 position pairs per 16-lane row), covering
         // the whole round's `n_all` columns; y: 16 k rows each.
         cp.dispatch_workgroups(
@@ -1801,11 +1939,12 @@ impl GpuAudioEncoder {
         n_total: usize,
         tpc: usize,
         cf: usize,
+        round_slot: usize,
     ) {
         let l = &self.conv[2];
         gpu.queue.write_buffer(
             &self.u_pm,
-            0,
+            (round_slot * 256) as u64,
             bytemuck::bytes_of(&PmCfg {
                 c: l.c_out as u32,
                 f: (l.plane / tpc) as u32,
@@ -1823,12 +1962,19 @@ impl GpuAudioEncoder {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.act[2].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: packed.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.u_pm.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.u_pm,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(64),
+                    }),
+                },
             ],
         });
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.permute);
-        cp.set_bind_group(0, &bg, &[]);
+        cp.set_bind_group(0, &bg, &[(round_slot * 256) as u32]);
         // One row per token — the grid is padded so the `packed` rows past
         // `n_total` (which the conv_out GEMM still reads) are written zero.
         cp.dispatch_workgroups(align(n_total, GEMM_BM) as u32, (cf / 2 / 256) as u32, 1);
@@ -1931,6 +2077,8 @@ impl GpuAudioEncoder {
                 beta: 0,
                 row0: 0,
                 lda: k as u32,
+                gqa_group: 1,
+                _pad: 0,
             }),
         );
         let bg = match bias {
