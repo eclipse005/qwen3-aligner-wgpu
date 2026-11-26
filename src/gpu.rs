@@ -545,14 +545,16 @@ impl Gpu {
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("qwen3-aligner-wgpu"),
                     // Timestamp queries gate the per-op step profiler; SUBGROUP lets
-                    // `gemv` use warp shuffles instead of shared-memory butterflies.
-                    // All three are intersected with what the adapter reports, so an
+                    // reductions use warp intrinsics instead of shared-memory
+                    // butterflies; SHADER_F16 enables native f16 GEMM tiles.
+                    // All are intersected with what the adapter reports, so an
                     // adapter without them still gets a device.
                     required_features: features
                         & (wgpu::Features::TIMESTAMP_QUERY
                             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
                             | wgpu::Features::SUBGROUP
+                            | wgpu::Features::SHADER_F16
                             | wgpu::Features::PIPELINE_CACHE),
                     required_limits: limits.clone(),
                     ..Default::default()
@@ -649,9 +651,76 @@ impl Gpu {
     /// is a 32-lane butterfly.  An adapter that reports any other subgroup width
     /// gets the shared-memory tree instead of a wrong answer.
     pub fn subgroup32(&self) -> bool {
-                self.features.contains(wgpu::Features::SUBGROUP)
+        self.features.contains(wgpu::Features::SUBGROUP)
             && self.info.subgroup_min_size == 32
             && self.info.subgroup_max_size == 32
+    }
+
+    /// Whether the adapter can execute native `f16` arithmetic in shaders.
+    pub fn has_f16(&self) -> bool {
+        self.features.contains(wgpu::Features::SHADER_F16)
+    }
+
+    /// Whether the adapter can execute WGSL `subgroup*` builtins.
+    pub fn has_subgroups(&self) -> bool {
+        self.features.contains(wgpu::Features::SUBGROUP)
+    }
+
+    /// Which softmax reduction this adapter should compile.
+    ///
+    /// Warp32 keeps the existing XOR butterfly exactly for NVIDIA/Apple, so
+    /// their reduction order (and therefore the gold gate) cannot move.
+    /// Other subgroup widths get the portable `subgroupAdd`/`subgroupMax`
+    /// path; devices without subgroups keep the shared-memory tree.
+    pub fn subgroup_mode(&self) -> crate::shaders::SubgroupMode {
+        if self.subgroup32() {
+            crate::shaders::SubgroupMode::Warp32
+        } else if self.has_subgroups() {
+            crate::shaders::SubgroupMode::Generic
+        } else {
+            crate::shaders::SubgroupMode::None
+        }
+    }
+
+    /// Whether to build GEMMs with native `f16` shared-memory tiles.
+    ///
+    /// Only valid for the f16 storage format: a bf16 checkpoint must keep the
+    /// existing bf16 unpacking path.  `QALIGN_F16_KERNEL` allows an A/B switch.
+    pub fn use_f16_kernel(&self) -> bool {
+        if crate::shaders::half() != crate::shaders::Half::F16 {
+            return false;
+        }
+        match std::env::var("QALIGN_F16_KERNEL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("0" | "off" | "no" | "false") => false,
+            Some("1" | "on" | "yes" | "true") | None => self.has_f16(),
+            Some(_) => self.has_f16(),
+        }
+    }
+
+    /// Whether to use the 128-bit `vec4<u32>` loader on `128x128` GEMM tiles.
+    ///
+    /// Enabled by default on modern GPUs (`SHADER_F16` adapters) and always
+    /// used on `64x64` / native-`f16` tiles; legacy Pascal GPUs stay on the
+    /// 2-row-per-warp scalar loader by default so they keep zero regression,
+    /// with `QALIGN_VEC4_GEMM=0/1` available for paired A/B testing.
+    pub fn use_vec4_gemm(&self) -> bool {
+        match std::env::var("QALIGN_VEC4_GEMM")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("0" | "off" | "no" | "false") => false,
+            Some("1" | "on" | "yes" | "true") => true,
+            _ => self.has_f16(),
+        }
     }
 
     /// One-line description for logs and reports.
@@ -778,7 +847,7 @@ impl Gpu {
         entry: &str,
         layout: Option<&wgpu::PipelineLayout>,
     ) -> Result<wgpu::ComputePipeline> {
-        let source = format!("{}{wgsl}", crate::shaders::half().prelude());
+        let source = assemble_wgsl(crate::shaders::half().prelude(), wgsl);
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
@@ -998,9 +1067,33 @@ impl<'a> BulkUpload<'a> {
     }
 }
 
+/// Put WGSL `enable` directives ahead of the process-wide half prelude.
+///
+/// WGSL requires module-scope `enable` directives before declarations.  A
+/// shader builder may emit them at the top of its own source, while the
+/// prelude starts with `fn unpack_h`, so prepending the prelude naively would
+/// make an otherwise valid shader fail to parse.
+pub(crate) fn assemble_wgsl(prelude: &str, wgsl: &str) -> String {
+    let mut rest = wgsl;
+    let mut enables = String::new();
+    loop {
+        let trim = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if !trim.starts_with("enable ") {
+            break;
+        }
+        let Some(end) = trim.find(';') else { break };
+        let (directive, tail) = trim.split_at(end + 1);
+        enables.push_str(directive.trim());
+        enables.push('\n');
+        rest = tail;
+    }
+    format!("{enables}{prelude}{rest}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shaders::Half;
 
     #[test]
     fn auto_orders_discrete_before_integrated() {
@@ -1008,6 +1101,22 @@ mod tests {
         assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
         assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
         assert!(device_class(VirtualGpu) < device_class(Cpu));
+    }
+
+    #[test]
+    fn assemble_wgsl_hoists_enable_directives() {
+        let src = "\n  enable f16;\nenable subgroups;\n\nfn gemm() {}\n";
+        let out = assemble_wgsl(Half::F16.prelude(), src);
+        assert!(out.starts_with("enable f16;\nenable subgroups;\n"));
+        assert!(out.find("enable f16;").unwrap() < out.find("fn unpack_h").unwrap());
+        assert!(out.find("enable subgroups;").unwrap() < out.find("fn unpack_h").unwrap());
+        assert!(out.ends_with("fn gemm() {}\n"));
+    }
+
+    #[test]
+    fn assemble_wgsl_leaves_plain_shaders_unchanged() {
+        let src = "fn gemm() {}\n";
+        assert_eq!(assemble_wgsl(Half::F16.prelude(), src), format!("{}{src}", Half::F16.prelude()));
     }
 
     #[test]

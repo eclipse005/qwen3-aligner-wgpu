@@ -177,6 +177,22 @@ fn write_silu_rows(gpu: &Gpu, cfg: &TextConfig, u_silu: &wgpu::Buffer, rows: usi
     (gx, gy)
 }
 
+/// `QALIGN_TILE64=auto|on|off` override shared by both GPU towers.
+/// `None` leaves the caller's automatic threshold in place.
+pub(crate) fn tile64_mode() -> Option<bool> {
+    match std::env::var("QALIGN_TILE64")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on" | "1" | "yes" | "true") => Some(true),
+        Some("off" | "0" | "no" | "false") => Some(false),
+        _ => None,
+    }
+}
+
 pub(crate) fn grid_xy(workgroups: usize) -> (u32, u32) {
     let gx = workgroups.clamp(1, 65_535) as u32;
     let gy = workgroups.div_ceil(gx as usize).max(1) as u32;
@@ -369,6 +385,25 @@ struct Layer {
     dp_w: wgpu::Buffer,
 }
 
+impl Pipes {
+    /// `gemm`, `gemm_acc`, `gemm_av`, `gemm_causal`, `gemm_av_causal` by index;
+    /// `small` selects the 64×64 sibling.
+    fn pipe(&self, small: bool, i: usize) -> &wgpu::ComputePipeline {
+        match (small, i) {
+            (false, 0) => &self.gemm,
+            (false, 1) => &self.gemm_acc,
+            (false, 2) => &self.gemm_av,
+            (false, 3) => &self.gemm_causal,
+            (false, _) => &self.gemm_av_causal,
+            (true, 0) => &self.gemm64,
+            (true, 1) => &self.gemm64_acc,
+            (true, 2) => &self.gemm64_av,
+            (true, 3) => &self.gemm64_causal,
+            (true, _) => &self.gemm64_av_causal,
+        }
+    }
+}
+
 struct Pipes {
     rms_norm: wgpu::ComputePipeline,
     extract: wgpu::ComputePipeline,
@@ -383,6 +418,12 @@ struct Pipes {
     gemm_causal: wgpu::ComputePipeline,
     /// AV GEMM with the causal k bound (skips the softmax's exact zeros).
     gemm_av_causal: wgpu::ComputePipeline,
+    /// The 64×64 siblings of the five GEMMs above, for short shapes.
+    gemm64: wgpu::ComputePipeline,
+    gemm64_acc: wgpu::ComputePipeline,
+    gemm64_av: wgpu::ComputePipeline,
+    gemm64_causal: wgpu::ComputePipeline,
+    gemm64_av_causal: wgpu::ComputePipeline,
     /// Causal softmax, one pipeline per block size (reduction tree depends on it).
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
     /// Slabbed causal attention: per-slab `(max, Σexp)`, the per-row merge
@@ -532,15 +573,22 @@ impl WgpuTextDecoder {
         let slab_weights_pl = family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2);
         let slab_merge_pl =
             family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3);
+        let use_vec4 = gpu.use_vec4_gemm();
+        let use_f16 = gpu.use_f16_kernel();
         let jobs = [
             PipeJob::new("rms_norm", shaders::rms_norm(hs, rms_bs), "rms_norm", None),
             PipeJob::new("qkv_extract", shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None),
             PipeJob::new("silu30", shaders::silu_mul_split(inter), "silu_mul_split", None),
-            PipeJob::new("gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_pl)),
-            PipeJob::new("gemm_acc", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl)),
-            PipeJob::new("gemm_av", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl)),
-            PipeJob::new("gemm_causal", shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl)),
-            PipeJob::new("gemm_av_causal", shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm", shaders::prefill_gemm_cfg(8, 8, false, false, false, false, false, use_vec4, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_acc", shaders::prefill_gemm_cfg(8, 8, false, true, false, false, false, use_vec4, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av", shaders::prefill_gemm_cfg(8, 8, true, false, false, false, false, use_vec4, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_causal", shaders::prefill_gemm_cfg(8, 8, false, false, false, true, false, use_vec4, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av_causal", shaders::prefill_gemm_cfg(8, 8, true, false, false, false, true, use_vec4, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm64", shaders::prefill_gemm_cfg(4, 4, false, false, false, false, false, true, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm64_acc", shaders::prefill_gemm_cfg(4, 4, false, true, false, false, false, true, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm64_av", shaders::prefill_gemm_cfg(4, 4, true, false, false, false, false, true, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm64_causal", shaders::prefill_gemm_cfg(4, 4, false, false, false, true, false, true, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm64_av_causal", shaders::prefill_gemm_cfg(4, 4, true, false, false, false, true, true, use_f16), "gemm", Some(&gemm_pl)),
             PipeJob::new("slab_stats", shaders::slab_stats(SLAB_BS, SLAB_T), "slab_stats", Some(&slab_stats_pl)),
             PipeJob::new("slab_weights", shaders::slab_weights(256), "slab_weights", Some(&slab_weights_pl)),
             PipeJob::new("slab_merge", shaders::slab_merge(nqh, hd), "slab_merge", Some(&slab_merge_pl)),
@@ -561,7 +609,12 @@ impl WgpuTextDecoder {
             gemm_av: take("gemm_av")?,
             gemm_causal: take("gemm_causal")?,
             gemm_av_causal: take("gemm_av_causal")?,
-            softmax: std::collections::HashMap::from([ (32, build("softmax32", &shaders::softmax_causal(32, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (64, build("softmax64", &shaders::softmax_causal(64, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (128, build("softmax128", &shaders::softmax_causal(128, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (256, build("softmax256", &shaders::softmax_causal(256, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (512, build("softmax512", &shaders::softmax_causal(512, gpu.subgroup32()), "softmax", Some(&sm_pl))?), (1024, build("softmax1024", &shaders::softmax_causal(1024, gpu.subgroup32()), "softmax", Some(&sm_pl))?),  ]),
+            gemm64: take("gemm64")?,
+            gemm64_acc: take("gemm64_acc")?,
+            gemm64_av: take("gemm64_av")?,
+            gemm64_causal: take("gemm64_causal")?,
+            gemm64_av_causal: take("gemm64_av_causal")?,
+            softmax: std::collections::HashMap::from([ (32, build("softmax32", &shaders::softmax_causal_mode(32, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?), (64, build("softmax64", &shaders::softmax_causal_mode(64, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?), (128, build("softmax128", &shaders::softmax_causal_mode(128, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?), (256, build("softmax256", &shaders::softmax_causal_mode(256, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?), (512, build("softmax512", &shaders::softmax_causal_mode(512, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?), (1024, build("softmax1024", &shaders::softmax_causal_mode(1024, gpu.subgroup_mode()), "softmax", Some(&sm_pl))?),  ]),
             slab_stats: take("slab_stats")?,
             slab_weights: take("slab_weights")?,
             slab_merge: take("slab_merge")?,
@@ -666,7 +719,6 @@ impl WgpuTextDecoder {
 
     // ── KV cache / RoPE plumbing ─────────────────────────────────────────
 
-    /// The device the decoder lives on — shared with the GPU audio tower.
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
     }
@@ -1013,8 +1065,14 @@ impl WgpuTextDecoder {
         let hd = cfg.head_dim;
         let inter = cfg.intermediate_size;
         let cur = kv_start + s;
-        let mp = s.div_ceil(128) * 128; // m-side tile rows
-        let np = cur.div_ceil(128) * 128; // n-side tile columns
+        // Modern f16-capable GPUs have high SM counts and lower shared-memory
+        // pressure, so short sequences benefit from 64x64 wave occupancy;
+        // older non-f16 GPUs keep 128x128 by default (`QALIGN_TILE64` overrides).
+        let tile64 = tile64_mode().unwrap_or(self.gpu.has_f16() && s <= 512);
+        let bm = if tile64 { 64 } else { 128 };
+        let bn = if tile64 { 64 } else { 128 };
+        let mp = s.div_ceil(128) * 128; // buffer padding stays 128-row aligned
+        let np = cur.div_ceil(128) * 128;
         let cur16 = cur.div_ceil(16) * 16; // k-side zero pad for the AV GEMM
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
 
@@ -1024,7 +1082,7 @@ impl WgpuTextDecoder {
         // mode for that is garbage rather than an error, so the flat path refuses
         // explicitly.
         let slab_t = SLAB_T;
-        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
+        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size;
         let n_slab = if slab_path(s, nqh, bind_limit) { cur.div_ceil(slab_t) } else { 0 };
         let slabbed = n_slab > 0;
         // Attention reads whole key slabs directly from the shared K/V
@@ -1355,6 +1413,14 @@ impl WgpuTextDecoder {
 
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let mut cp = enc.begin_compute_pass(&Default::default());
+        // Resolve the pipelines once: `self.pipe()` borrows `self`, which cannot
+        // coexist with the mutable borrow of `self.debug_prefill_h` held by the
+        // state below.
+        let pipe0 = Pipes::pipe(&self.pipes, tile64, 0);
+        let pipe1 = Pipes::pipe(&self.pipes, tile64, 1);
+        let pipe2 = Pipes::pipe(&self.pipes, tile64, 2);
+        let pipe3 = Pipes::pipe(&self.pipes, tile64, 3);
+        let pipe4 = Pipes::pipe(&self.pipes, tile64, 4);
 
         // Ablation hook (see `encode_step`).
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
@@ -1451,9 +1517,9 @@ impl WgpuTextDecoder {
             // 2. qkv GEMM  [s, fused] = normed × qkv_wᵀ
             gemm_or_skip!(
                 "qkv",
-                &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
+                &mut cp, pipe0, &normed, &layer.qkv_w, &qkv,
                 s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0, 1,
-                (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                (cfg.fused_qkv_cols() / bn) as u32, (mp / bm) as u32, 1
             );
 
             // 3. extract Q/K/V for all positions (K/V land in the cache)
@@ -1489,12 +1555,12 @@ impl WgpuTextDecoder {
                 let spart = slab_part.as_ref().unwrap();
                 let sstats = slab_stats.as_ref().unwrap();
                 let swt = slab_w.as_ref().unwrap();
-                let sgrid = ((slab_t / 128) as u32, (mp / 128) as u32, nqh as u32);
+                let sgrid = ((slab_t / bn) as u32, (mp / bm) as u32, nqh as u32);
                 for t in 0..n_slab {
                     // score tile [mp, T] = q × K[t0..t0+T)ᵀ, tiles above the
                     // diagonal skipped (slab GDims pre-written in slots 0..n_slab)
                     gemm_slot!(
-                        &mut cp, &self.pipes.gemm_causal, &q_out, &self.k_buf, &scores,
+                        &mut cp, pipe3, &q_out, &self.k_buf, &scores,
                         0u64, t,
                         sgrid.0, sgrid.1, sgrid.2
                     );
@@ -1502,7 +1568,7 @@ impl WgpuTextDecoder {
                     // output, so re-dispatching leaves the token stream alone.
                     if dup == "p_scores" {
                         gemm_slot!(
-                            &mut cp, &self.pipes.gemm_causal, &q_out, &self.k_buf, &scores,
+                            &mut cp, pipe3, &q_out, &self.k_buf, &scores,
                             0u64, t,
                             sgrid.0, sgrid.1, sgrid.2
                         );
@@ -1564,15 +1630,15 @@ impl WgpuTextDecoder {
                     // this slab's AV output: [mp, nqh·hd], k bounded by the
                     // diagonal inside the slab (GDims pre-written in n_slab..2*n_slab)
                     gemm_slot!(
-                        &mut cp, &self.pipes.gemm_av_causal, &attn, &self.v_buf, spart,
+                        &mut cp, pipe4, &attn, &self.v_buf, spart,
                         (t * mp * nqh * hd * 2) as u64, n_slab + t,
-                        1, (mp / 128) as u32, nqh as u32
+                        (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                     if dup == "p_av" {
                         gemm_slot!(
-                            &mut cp, &self.pipes.gemm_av_causal, &attn, &self.v_buf, spart,
+                            &mut cp, pipe4, &attn, &self.v_buf, spart,
                             (t * mp * nqh * hd * 2) as u64, n_slab + t,
-                            1, (mp / 128) as u32, nqh as u32
+                            (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                         );
                     }
                 }
@@ -1626,17 +1692,17 @@ impl WgpuTextDecoder {
                 // bsc stays in ELEMENTS (the epilogue divides the sum by 2)
                 gemm_or_skip!(
                     "scores",
-                    &mut cp, &self.pipes.gemm_causal, &q_out, &self.k_buf, &scores,
+                    &mut cp, pipe3, &q_out, &self.k_buf, &scores,
                     s, cur, hd, np, mp * hd / 2, kv_stride * hd / 2, mp * np, (nqh / nkvh) as u32,
-                    (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                    (np / bn) as u32, (mp / bm) as u32, nqh as u32
                 );
                 // Ablation hook: re-dispatching is idempotent (the GEMM overwrites
                 // its output), so the token stream is unchanged.
                 if dup == "p_scores" {
                     gemm!(
-                        &mut cp, &self.pipes.gemm, &q_out, &self.k_buf, &scores,
+                        &mut cp, pipe0, &q_out, &self.k_buf, &scores,
                         s, cur, hd, np, mp * hd / 2, kv_stride * hd / 2, mp * np, (nqh / nkvh) as u32,
-                        (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                        (np / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                 }
 
@@ -1669,15 +1735,15 @@ impl WgpuTextDecoder {
                 // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
                 gemm_or_skip!(
                     "av",
-                    &mut cp, &self.pipes.gemm_av_causal, &attn, &self.v_buf, &attn_flat,
+                    &mut cp, pipe4, &attn, &self.v_buf, &attn_flat,
                     s, hd, cur16, nqh * hd, mp * cur16 / 2, kv_stride * hd / 2, hd, (nqh / nkvh) as u32,
-                    1, (mp / 128) as u32, nqh as u32
+                    (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                 );
                 if dup == "p_av" {
                     gemm!(
-                        &mut cp, &self.pipes.gemm_av, &attn, &self.v_buf, &attn_flat,
+                        &mut cp, pipe2, &attn, &self.v_buf, &attn_flat,
                         s, hd, cur16, nqh * hd, mp * cur16 / 2, kv_stride * hd / 2, hd, (nqh / nkvh) as u32,
-                        1, (mp / 128) as u32, nqh as u32
+                        (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                 }
             }
@@ -1685,9 +1751,9 @@ impl WgpuTextDecoder {
             // 8. o projection + residual:  h += attn_flat × o_wᵀ
             gemm_or_skip!(
                 "o",
-                &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
+                &mut cp, pipe1, &attn_flat, &layer.o_w, &h_buf,
                 s, hs, nqh * hd, hs, 0, 0, 0, 1,
-                (hs / 128) as u32, (mp / 128) as u32, 1
+                (hs / bn) as u32, (mp / bm) as u32, 1
             );
 
             // 9. rms_norm(h, pln) → norm2
@@ -1711,9 +1777,9 @@ impl WgpuTextDecoder {
             // 10. gate/up GEMM → silu → down GEMM + residual
             gemm_or_skip!(
                 "gu",
-                &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
+                &mut cp, pipe0, &norm2, &layer.gu_w, &gu,
                 s, 2 * inter, hs, 2 * inter, 0, 0, 0, 1,
-                ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                ((2 * inter) / bn) as u32, (mp / bm) as u32, 1
             );
 
             let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1734,9 +1800,9 @@ impl WgpuTextDecoder {
 
             gemm_or_skip!(
                 "down",
-                &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
+                &mut cp, pipe1, &activated, &layer.dp_w, &h_buf,
                 s, hs, inter, hs, 0, 0, 0, 1,
-                (hs / 128) as u32, (mp / 128) as u32, 1
+                (hs / bn) as u32, (mp / bm) as u32, 1
             );
 
             // Measurement dump: `h` now holds layer `li`'s output.

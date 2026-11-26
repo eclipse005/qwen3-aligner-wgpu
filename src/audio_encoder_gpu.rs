@@ -32,6 +32,7 @@ use crate::half16::H16 as f16;
 
 use crate::audio_encoder::feo;
 use crate::config::AudioEncoderConfig;
+use crate::decoder::tile64_mode;
 use crate::gpu::{BulkUpload, Gpu, PipeJob};
 use crate::shaders;
 use crate::weights::{self, PackedWeight, RawTensor};
@@ -41,6 +42,17 @@ use crate::weights::{self, PackedWeight, RawTensor};
 const GEMM_BM: usize = shaders::PREFILL_GEMM_BM;
 const GEMM_BN: usize = shaders::PREFILL_GEMM_BN;
 const GEMM_BK: usize = shaders::PREFILL_GEMM_BK;
+
+fn tile_edges(has_f16: bool, m: usize, n: usize, batch: usize) -> (usize, usize, bool) {
+    let small = tile64_mode().unwrap_or_else(|| {
+        has_f16 && m <= 512 && (n / GEMM_BN) * m.div_ceil(GEMM_BM) * batch.max(1) < 64
+    });
+    if small {
+        (shaders::PREFILL_GEMM64_BM, shaders::PREFILL_GEMM64_BN, true)
+    } else {
+        (GEMM_BM, GEMM_BN, false)
+    }
+}
 /// Conv taps: `3×3`, always one whole k-group of 16 per input channel.
 const TAPS: usize = 9;
 /// Token capacity of the preallocated pipeline (~22 min of audio).
@@ -353,6 +365,23 @@ struct GpuLayer {
 
 // ─── Pipelines ─────────────────────────────────────────────────────
 
+impl Pipes {
+    fn gemm(&self, small: bool, kind: usize) -> &wgpu::ComputePipeline {
+        match (small, kind) {
+            (false, 0) => &self.gemm,
+            (false, 1) => &self.gemm_t,
+            (false, 2) => &self.gemm_beta,
+            (false, 3) => &self.gemm_bias,
+            (false, _) => &self.gemm_beta_bias,
+            (true, 0) => &self.gemm64,
+            (true, 1) => &self.gemm64_t,
+            (true, 2) => &self.gemm64_beta,
+            (true, 3) => &self.gemm64_bias,
+            (true, _) => &self.gemm64_beta_bias,
+        }
+    }
+}
+
 struct Pipes {
     im2col: wgpu::ComputePipeline,
     gelu: wgpu::ComputePipeline,
@@ -366,6 +395,12 @@ struct Pipes {
     /// `proj2`); `(false, true, true)` for residual+bias (`out_proj`, `fc2`).
     gemm_bias: wgpu::ComputePipeline,
     gemm_beta_bias: wgpu::ComputePipeline,
+    /// 64×64 siblings of the five GEMM pipelines above.
+    gemm64: wgpu::ComputePipeline,
+    gemm64_t: wgpu::ComputePipeline,
+    gemm64_beta: wgpu::ComputePipeline,
+    gemm64_bias: wgpu::ComputePipeline,
+    gemm64_beta_bias: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     layernorm: wgpu::ComputePipeline,
     permute: wgpu::ComputePipeline,
@@ -1002,16 +1037,23 @@ impl GpuAudioEncoder {
         let pm_layout = gemm_layout(gpu, "enc_permute", 2, &[1]);
         // A bias needs a storage binding *after* the dynamic-offset uniform.
         let gemm_bias_layout = gemm_bias_layout(gpu, "enc_gemm_bias", &[2]);
+        let use_vec4 = gpu.use_vec4_gemm();
+        let use_f16 = gpu.use_f16_kernel();
         let jobs = [
             PipeJob::new("enc_im2col", shaders::audio_im2col(), "im2col", Some(&im_layout)),
             PipeJob::new("enc_gelu", shaders::audio_bias_gelu(), "bias_gelu", None),
-            PipeJob::new("enc_gemm", shaders::prefill_gemm(false, false), "gemm", Some(&enc_gemm_layout)),
-            PipeJob::new("enc_gemm_t", shaders::prefill_gemm(true, false), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm", shaders::prefill_gemm_cfg(8, 8, false, false, false, false, false, use_vec4, use_f16), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm_t", shaders::prefill_gemm_cfg(8, 8, true, false, false, false, false, use_vec4, use_f16), "gemm", Some(&enc_gemm_layout)),
             PipeJob::new("enc_extract", shaders::audio_extract_qkv(), "extract", None),
             PipeJob::new("enc_win_pack", shaders::audio_win_pack(), "win_pack", None),
-            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm(false, true), "gemm", Some(&enc_gemm_layout)),
-            PipeJob::new("enc_gemm_bias", shaders::prefill_gemm_bias(false, false), "gemm", Some(&gemm_bias_layout)),
-            PipeJob::new("enc_gemm_beta_bias", shaders::prefill_gemm_bias(false, true), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm_cfg(8, 8, false, true, false, false, false, use_vec4, use_f16), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm_bias", shaders::prefill_gemm_cfg(8, 8, false, false, true, false, false, use_vec4, use_f16), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_gemm_beta_bias", shaders::prefill_gemm_cfg(8, 8, false, true, true, false, false, use_vec4, use_f16), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_gemm64", shaders::prefill_gemm_cfg(4, 4, false, false, false, false, false, true, use_f16), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm64_t", shaders::prefill_gemm_cfg(4, 4, true, false, false, false, false, true, use_f16), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm64_beta", shaders::prefill_gemm_cfg(4, 4, false, true, false, false, false, true, use_f16), "gemm", Some(&enc_gemm_layout)),
+            PipeJob::new("enc_gemm64_bias", shaders::prefill_gemm_cfg(4, 4, false, false, true, false, false, true, use_f16), "gemm", Some(&gemm_bias_layout)),
+            PipeJob::new("enc_gemm64_beta_bias", shaders::prefill_gemm_cfg(4, 4, false, true, true, false, false, true, use_f16), "gemm", Some(&gemm_bias_layout)),
             PipeJob::new("enc_softmax", shaders::audio_window_softmax(), "softmax", None),
             PipeJob::new("enc_layernorm", shaders::audio_layernorm(), "layernorm", None),
             PipeJob::new("enc_permute", shaders::audio_permute_pe(), "permute_pe", Some(&pm_layout)),
@@ -1034,6 +1076,11 @@ impl GpuAudioEncoder {
             gemm_beta: take("enc_gemm_beta")?,
             gemm_bias: take("enc_gemm_bias")?,
             gemm_beta_bias: take("enc_gemm_beta_bias")?,
+            gemm64: take("enc_gemm64")?,
+            gemm64_t: take("enc_gemm64_t")?,
+            gemm64_beta: take("enc_gemm64_beta")?,
+            gemm64_bias: take("enc_gemm64_bias")?,
+            gemm64_beta_bias: take("enc_gemm64_beta_bias")?,
             softmax: take("enc_softmax")?,
             layernorm: take("enc_layernorm")?,
             permute: take("enc_permute")?,
@@ -1754,10 +1801,11 @@ impl GpuAudioEncoder {
         ldc: usize,
         bias: Option<&wgpu::Buffer>,
     ) {
-        let pipe = if bias.is_some() { &self.p.gemm_beta_bias } else { &self.p.gemm_beta };
+        let (bm, bn, small) = tile_edges(gpu.has_f16(), m, n, 1);
+        let kind = if bias.is_some() { 4 } else { 2 };
         self.dispatch_gemm(
-            gpu, enc, pipe, a, w, c, m, n, k, ldc, 0, 0, 0, 1,
-            (n / GEMM_BN) as u32, (align(m, GEMM_BM) / GEMM_BM) as u32, bias,
+            gpu, enc, self.p.gemm(small, kind), a, w, c, m, n, k, ldc, 0, 0, 0, 1,
+            (n / bn) as u32, (m.div_ceil(bm)) as u32, bias,
         );
     }
 
@@ -1830,10 +1878,11 @@ impl GpuAudioEncoder {
         ldc: usize,
         bias: Option<&wgpu::Buffer>,
     ) {
-        let pipe = if bias.is_some() { &self.p.gemm_bias } else { &self.p.gemm };
+        let (bm, bn, small) = tile_edges(gpu.has_f16(), m, n, 1);
+        let kind = if bias.is_some() { 3 } else { 0 };
         self.dispatch_gemm(
-            gpu, enc, pipe, a, w, c, m, n, k, ldc, 0, 0, 0, 1,
-            (n / GEMM_BN) as u32, (align(m, GEMM_BM) / GEMM_BM) as u32, bias,
+            gpu, enc, self.p.gemm(small, kind), a, w, c, m, n, k, ldc, 0, 0, 0, 1,
+            (n / bn) as u32, (m.div_ceil(bm)) as u32, bias,
         );
     }
 
@@ -1843,10 +1892,11 @@ impl GpuAudioEncoder {
     /// channel-major; `n_all == ldc`, one row per channel.
     fn gemm_conv(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, level: usize) {
         let l = &self.conv[level];
+        let (bm, bn, small) = tile_edges(gpu.has_f16(), l.m_pad, l.n_all, 1);
         self.dispatch_gemm(
-            gpu, enc, &self.p.gemm_t, &l.w.w, &self.col[level], &self.raw[level],
+            gpu, enc, self.p.gemm(small, 1), &l.w.w, &self.col[level], &self.raw[level],
             l.m_pad, l.n_all, l.k_pad, l.n_all, 0, 0, 0, 1,
-            (l.n_all / GEMM_BN) as u32, (l.m_pad / GEMM_BM) as u32, None,
+            (l.n_all / bn) as u32, (l.m_pad / bm) as u32, None,
         );
     }
 
@@ -2030,10 +2080,14 @@ impl GpuAudioEncoder {
         bsb: usize,
         bsc: usize,
         batch: usize,
-        gx: u32,
-        gy: u32,
+        _gx: u32,
+        _gy: u32,
         _reserved: usize,
     ) {
+        let (bm, bn, small) = tile_edges(gpu.has_f16(), m, n, batch);
+        let pipe = if small { &self.p.gemm64_t } else { pipe };
+        let gx = (n / bn) as u32;
+        let gy = m.div_ceil(bm) as u32;
         self.dispatch_gemm(gpu, enc, pipe, a, w, c, m, n, k, ldc, bsa, bsb, bsc, batch, gx, gy, None);
     }
 

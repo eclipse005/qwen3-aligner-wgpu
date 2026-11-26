@@ -24,6 +24,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
+/// Which WGSL subgroup reduction a device can execute.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubgroupMode {
+    None,
+    Warp32,
+    Generic,
+}
+
 /// The 16-bit storage format, as a shader prelude.
 ///
 /// Both variants present the same interface to a kernel: `unpack_h(w) ->
@@ -181,6 +189,101 @@ pub fn rne_bf16_bits(x: f32) -> u16 {
 #[cfg(test)]
 mod bf16_round_tests {
     use super::*;
+
+    #[test]
+    fn generic_subgroups_use_portable_reductions() {
+        let wgsl = softmax_causal_mode(256, SubgroupMode::Generic);
+        assert!(!wgsl.contains("enable subgroups;"));
+        assert!(wgsl.contains("subgroupMax(lmax)"));
+        assert!(wgsl.contains("subgroupAdd(lsum)"));
+        assert!(wgsl.contains("@builtin(subgroup_invocation_id) sg_lid"));
+        assert!(wgsl.contains("@builtin(subgroup_size) sg_size"));
+        assert!(!wgsl.contains("subgroupShuffleXor"));
+        assert!(!wgsl.contains("red_max"));
+        assert!(!wgsl.contains("red_sum"));
+    }
+
+    #[test]
+    fn legacy_softmax_arms_stay_bit_identical() {
+        assert_eq!(softmax_causal(256, false), softmax_causal_mode(256, SubgroupMode::None));
+        assert_eq!(softmax_causal(256, true), softmax_causal_mode(256, SubgroupMode::Warp32));
+        assert!(softmax_causal_mode(256, SubgroupMode::Warp32).contains("subgroupShuffleXor"));
+        assert!(!softmax_causal_mode(256, SubgroupMode::None).contains("subgroupShuffleXor"));
+    }
+
+    #[test]
+    fn gemm_variants_have_expected_tiles_and_precision() {
+        let scalar128 = prefill_gemm_cfg(8, 8, false, false, false, false, false, false, false);
+        assert!(scalar128.contains("const BM: u32 = 128u;"));
+        assert!(scalar128.contains("const BN: u32 = 128u;"));
+        assert!(!scalar128.contains("array<vec4<u32>>"));
+        assert!(!scalar128.contains("enable f16;"));
+        for tm in [4, 8] {
+            let tile = 16 * tm;
+            let wgsl = prefill_gemm_cfg(tm, tm, false, false, false, false, false, true, false);
+            assert!(wgsl.contains(&format!("const BM: u32 = {tile}u;")));
+            assert!(wgsl.contains(&format!("const BN: u32 = {tile}u;")));
+            assert!(wgsl.contains("var<workgroup> As: array<f32,"));
+            assert!(!wgsl.contains("enable f16;"));
+            assert!(wgsl.contains("array<vec4<u32>>"));
+            let f16wgsl = prefill_gemm_cfg(tm, tm, false, false, false, false, false, true, true);
+            assert!(f16wgsl.starts_with("enable f16;\n"));
+            assert!(f16wgsl.contains("array<f16,"));
+            assert!(f16wgsl.contains("bitcast<vec2<f16>>"));
+            assert!(f16wgsl.contains("array<vec4<u32>>"));
+            assert!(f16wgsl.contains("f32(As["));
+            assert!(f16wgsl.contains("f32(Bs["));
+        }
+        let wgsl64 = prefill_gemm_cfg(4, 4, true, true, true, true, true, false, false);
+        assert!(wgsl64.contains("const BM: u32 = 64u;"));
+        assert!(wgsl64.contains("const BN: u32 = 64u;"));
+        assert!(wgsl64.contains("const CAUSAL: u32 = 1u;"));
+        assert!(wgsl64.contains("const CAUSAL_K: u32 = 1u;"));
+        assert!(wgsl64.contains("array<vec4<u32>>"));
+    }
+
+    #[test]
+    fn vulkan_validates_stage3_wgsl_variants() {
+        let gpu = match pollster::block_on(crate::gpu::Gpu::new(Some("vulkan"))) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip vulkan WGSL validation test: {e}");
+                return;
+            }
+        };
+        // Validate portable subgroup softmax on real Vulkan + wgpu/Naga.
+        if gpu.has_subgroups() {
+            for bs in [32usize, 64, 128, 256, 512, 1024] {
+                let src = softmax_causal_mode(bs, SubgroupMode::Generic);
+                gpu.pipeline(&format!("test_sm_generic_{bs}"), &src, "softmax", None)
+                    .unwrap_or_else(|e| panic!("SubgroupMode::Generic bs={bs} failed: {e}"));
+            }
+        }
+        // Validate 128x128 and 64x64 vectorized GEMM shaders (and f16 if supported).
+        let f16_arms: &[bool] = if gpu.has_f16() { &[false, true] } else { &[false] };
+        for &use_f16 in f16_arms {
+            for tm in [4usize, 8] {
+                for &(transb, beta, bias, causal, causal_k) in &[
+                    (false, false, false, false, false),
+                    (false, true, false, false, false),
+                    (false, false, true, false, false),
+                    (false, true, true, false, false),
+                    (true, false, false, false, false),
+                    (false, false, false, true, false),
+                    (true, false, false, false, true),
+                ] {
+                    let src =
+                        prefill_gemm_cfg(tm, tm, transb, beta, bias, causal, causal_k, true, use_f16);
+                    gpu.pipeline("test_gemm_stage3", &src, "gemm", None)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "GEMM tm={tm} transb={transb} beta={beta} bias={bias} causal={causal} causal_k={causal_k} f16={use_f16} failed: {e}"
+                            )
+                        });
+                }
+            }
+        }
+    }
 
     /// The bf16 path's rounding has to be the reference's rule, or every layer
     /// it touches is off in a direction nobody chose.
@@ -1799,6 +1902,10 @@ pub const PREFILL_GEMM_BK: usize = 16;
 pub const PREFILL_GEMM_BM: usize = 16 * PREFILL_GEMM_TM;
 /// N tile width — `n` (the weight's row count) must be padded to a multiple.
 pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
+/// Narrow tile for short sequences.  BK stays at 16 so the FMA order is the
+/// same as the 128×128 kernel.
+pub const PREFILL_GEMM64_BM: usize = 64;
+pub const PREFILL_GEMM64_BN: usize = 64;
 
 /// `bias = 1` adds the per-column `Bias` vector (binding 4) before the `beta`
 /// residual.  `transb=1` reads W as a [k, n] f16 matrix instead of [n, k]
@@ -2076,6 +2183,275 @@ fn prefill_gemm_impl(
     s
 }
 
+/// Full GEMM configuration: micro-tile (`128x128` or `64x64`), transposition,
+/// bias, causal variant, 128-bit `vec4<u32>` coalesced global loads, and
+/// optional native `f16` shared-memory staging (always `f32` accumulation).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gemm_cfg(
+    tm: usize,
+    tn: usize,
+    transb: bool,
+    beta: bool,
+    bias: bool,
+    causal_skip: bool,
+    causal_k: bool,
+    use_vec4: bool,
+    use_f16: bool,
+) -> String {
+    let bm = 16 * tm;
+    let bn = 16 * tn;
+    assert!(
+        (bm, bn) == (PREFILL_GEMM_BM, PREFILL_GEMM_BN)
+            || (bm, bn) == (PREFILL_GEMM64_BM, PREFILL_GEMM64_BN),
+        "unsupported GEMM tile {bm}x{bn}"
+    );
+    if tm == 4 || use_f16 || use_vec4 {
+        prefill_gemm_vector_impl(
+            tm,
+            tn,
+            PREFILL_GEMM_BK,
+            transb,
+            beta,
+            bias,
+            causal_skip,
+            causal_k,
+            use_f16,
+        )
+    } else {
+        prefill_gemm_impl(transb, beta, bias, causal_skip, causal_k)
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+fn prefill_gemm_vector_impl(
+    tm: usize,
+    tn: usize,
+    bk: usize,
+    transb: bool,
+    beta: bool,
+    bias: bool,
+    causal_skip: bool,
+    causal_k: bool,
+    use_f16: bool,
+) -> String {
+    let bm = 16 * tm;
+    let bn = 16 * tn;
+    let pad = bk + 1;
+
+    let mut s = String::new();
+    if use_f16 {
+        s.push_str("enable f16;\n");
+    }
+    s.push_str(
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32, gqa_group: u32, _pad: u32 };\n\
+         @group(0) @binding(0) var<storage, read>       A: array<vec4<u32>>;\n\
+         @group(0) @binding(1) var<storage, read>       W: array<vec4<u32>>;\n\
+         @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
+         @group(0) @binding(3) var<uniform>             gd: GDims;\n",
+    );
+    if bias {
+        s.push_str("@group(0) @binding(4) var<storage, read> Bias: array<u32>;\n");
+    }
+    s.push_str(&format!(
+        "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
+         const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n\
+         const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n\
+         const CAUSAL: u32 = {}u;\nconst CAUSAL_K: u32 = {}u;\n",
+        u32::from(transb),
+        u32::from(beta),
+        u32::from(bias),
+        u32::from(causal_skip),
+        u32::from(causal_k),
+    ));
+    if use_f16 {
+        s.push_str(&format!("var<workgroup> As: array<f16, {}>;\n", bm * pad));
+        s.push_str(&format!("var<workgroup> Bs: array<f16, {}>;\n", bn * pad));
+    } else {
+        s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
+        s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
+    }
+    s.push_str(
+        "@compute @workgroup_size(16, 16)\n\
+         fn gemm(@builtin(workgroup_id) wid: vec3<u32>,\n\
+                 @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+         let tx = lid.x;\n let ty = lid.y;\n\
+         let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n\
+         let abase = wid.z * gd.bsa;\n let wb = (wid.z / max(gd.gqa_group, 1u)) * gd.bsb;\n\
+         let cbase = wid.z * gd.bsc;\n\
+         let tid = ty * 16u + tx;\n\
+         let alda4 = gd.lda >> 3u;\n let kk4 = gd.k >> 3u;\n\
+         let abase4 = abase >> 2u;\n let wb4 = wb >> 2u;\n\
+         let n4 = gd.n >> 3u;\n let n04 = n0 >> 3u;\n",
+    );
+    if bm == 64 {
+        s.push_str(" let t2 = tid - 128u;\n");
+    }
+    s.push_str(
+        " if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) { return; }\n\
+         let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
+    );
+
+    for i in 0..tm {
+        for j in 0..tn {
+            s.push_str(&format!("var c{i}{j}: f32 = 0.0;\n"));
+        }
+    }
+    s.push_str(" var pfa: vec4<u32> = vec4<u32>(0u);\n");
+    s.push_str(" var pfb: vec4<u32> = vec4<u32>(0u);\n");
+    s.push_str(" var k0: u32 = 0u;\n");
+
+    // One `vec4<u32>` is four packed words = eight halves.  Store into the
+    // padded shared tile at the same element positions the scalar kernel used.
+    let store_word = |name: &str, word: &str, base: &str| -> String {
+        let mut t = String::new();
+        let comps = ["x", "y", "z", "w"];
+        for (word_half, c) in comps.iter().enumerate() {
+            let pair = if use_f16 {
+                format!("bitcast<vec2<f16>>({word}.{c})")
+            } else {
+                format!("unpack_h({word}.{c})")
+            };
+            let vname = format!("u_{word}_{c}");
+            t.push_str(&format!("   let {vname} = {pair};\n"));
+            let e0 = word_half * 2;
+            let e1 = e0 + 1;
+            t.push_str(&format!("   {name}[{base} + {e0}u] = {vname}.x;\n"));
+            t.push_str(&format!("   {name}[{base} + {e1}u] = {vname}.y;\n"));
+        }
+        t
+    };
+    // For `transb=1` a vec4 holds 8 consecutive n-elements of one k-row, so
+    // the shared tile is stored row-major: row += 1, column stays at k.
+    let store_word_transb = |word: &str, n0: &str, k: &str| -> String {
+        let mut t = String::new();
+        let comps = ["x", "y", "z", "w"];
+        for (word_half, c) in comps.iter().enumerate() {
+            let pair = if use_f16 {
+                format!("bitcast<vec2<f16>>({word}.{c})")
+            } else {
+                format!("unpack_h({word}.{c})")
+            };
+            let vname = format!("ut_{word}_{c}");
+            t.push_str(&format!("   let {vname} = {pair};\n"));
+            let r0 = word_half * 2;
+            let r1 = r0 + 1;
+            t.push_str(&format!("   Bs[({n0} + {r0}u) * PAD + {k}] = {vname}.x;\n"));
+            t.push_str(&format!("   Bs[({n0} + {r1}u) * PAD + {k}] = {vname}.y;\n"));
+        }
+        t
+    };
+    let wrap = |body: String, cond: Option<&str>| -> String {
+        match cond {
+            Some(c) => format!(" if ({c}) {{\n{body} }}\n"),
+            None => body,
+        }
+    };
+    let a_cond = (bm == 64).then_some("tid < 128u");
+    let b_cond = (bn == 64).then_some("tid >= 128u");
+    let a_load = |kx: &str| -> String {
+        let body = format!(
+            "   pfa = A[abase4 + (m0 + (tid >> 1u)) * alda4 + ({kx} >> 3u) + (tid & 1u)];\n"
+        );
+        wrap(body, a_cond)
+    };
+    let a_store = || wrap(store_word("As", "pfa", "(tid >> 1u) * PAD + (tid & 1u) * 8u"), a_cond);
+    let b_load = |kx: &str| -> String {
+        let body = if !transb {
+            let (row, v4) = if bn == 128 {
+                ("(tid >> 1u)", "(tid & 1u)")
+            } else {
+                ("(t2 >> 1u)", "(t2 & 1u)")
+            };
+            format!("   pfb = W[wb4 + (gd.row0 + n0 + {row}) * kk4 + ({kx} >> 3u) + {v4}];\n")
+        } else if bn == 128 {
+            format!("   pfb = W[wb4 + (gd.row0 + {kx} + ty) * n4 + n04 + tx];\n")
+        } else {
+            format!(
+                "   pfb = W[wb4 + (gd.row0 + {kx} + (t2 >> 3u)) * n4 + n04 + (t2 & 7u)];\n"
+            )
+        };
+        wrap(body, b_cond)
+    };
+    let b_store = || {
+        if !transb {
+            let base = if bn == 128 {
+                "(tid >> 1u) * PAD + (tid & 1u) * 8u"
+            } else {
+                "(t2 >> 1u) * PAD + (t2 & 1u) * 8u"
+            };
+            wrap(store_word("Bs", "pfb", base), b_cond)
+        } else if bn == 128 {
+            wrap(store_word_transb("pfb", "(tx * 8u)", "ty"), None)
+        } else {
+            wrap(store_word_transb("pfb", "((t2 & 7u) * 8u)", "(t2 >> 3u)"), b_cond)
+        }
+    };
+
+    s.push_str(&a_load("k0"));
+    s.push_str(&b_load("k0"));
+    s.push_str(&a_store());
+    s.push_str(&b_store());
+    s.push_str(" workgroupBarrier();\n");
+    s.push_str(" loop {\n  if (k0 >= klim) { break; }\n");
+    s.push_str("  let kn = k0 + BK;\n  if (kn < klim) {\n");
+    s.push_str(&a_load("kn"));
+    s.push_str(&b_load("kn"));
+    s.push_str("  }\n");
+
+    let mut t = String::new();
+    t.push_str("  var q: u32 = 0u;\n  loop {\n   if (q >= BK) { break; }\n");
+    for i in 0..tm {
+        if use_f16 {
+            t.push_str(&format!("   let a{i} = f32(As[(ty * {tm}u + {i}u) * PAD + q]);\n"));
+        } else {
+            t.push_str(&format!("   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"));
+        }
+    }
+    for j in 0..tn {
+        if use_f16 {
+            t.push_str(&format!("   let b{j} = f32(Bs[(tx * {tn}u + {j}u) * PAD + q]);\n"));
+        } else {
+            t.push_str(&format!("   let b{j} = Bs[(tx * {tn}u + {j}u) * PAD + q];\n"));
+        }
+    }
+    for i in 0..tm {
+        for j in 0..tn {
+            t.push_str(&format!("   c{i}{j} = c{i}{j} + a{i} * b{j};\n"));
+        }
+    }
+    t.push_str("   q = q + 1u;\n  }\n");
+    s.push_str(&t);
+    s.push_str("  workgroupBarrier();\n  if (kn < klim) {\n");
+    s.push_str(&a_store());
+    s.push_str(&b_store());
+    s.push_str("  }\n  workgroupBarrier();\n  k0 = kn;\n }\n");
+
+    for i in 0..tm {
+        s.push_str(&format!("let row{i} = m0 + ty * {tm}u + {i}u;\n"));
+    }
+    for i in 0..tm {
+        for e in 0..tn / 2 {
+            let je = 2 * e;
+            let jo = je + 1;
+            s.push_str(&format!(
+                "let we{i}_{e} = (cbase + row{i} * gd.ldc + n0 + tx * {tn}u + {je}u) / 2u;\n"
+            ));
+            s.push_str(&format!("var v{i}{e} = vec2<f32>(c{i}{je}, c{i}{jo});\n"));
+            if bias {
+                s.push_str(&format!(
+                    "v{i}{e} = v{i}{e} + unpack_h(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
+                ));
+            }
+            s.push_str(&format!(
+                "if (BETA == 1u) {{\n  let old = unpack_h(C[we{i}_{e}]);\n  v{i}{e} = v{i}{e} + old;\n}}\n"
+            ));
+            s.push_str(&format!("C[we{i}_{e}] = pack_h(v{i}{e});\n"));
+        }
+    }
+    s.push_str("}\n");
+    s
+}
+
 /// The tree the engine's shared-memory halving steps leave in lane `i < 32`,
 /// written as one expression: `bs / 32` partials, each the serial sum of one
 /// lane-strided strip, combined exactly as `for sh = bs/2 … 32 { red[i] op=
@@ -2157,7 +2533,7 @@ fn softmax_butterfly(is_max: bool, var: &str) -> String {
 /// `examples/attn_sm.rs` checks the two arms word for word (169 M outputs, 0
 /// differ) and prices them (17% of the kernel, which is 12% of a prefill).
 /// Without the feature the shared tree stays as it was.
-pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+fn softmax_causal_stage2(bs: usize, subgroup: bool) -> String {
     let (max_tree, sum_tree, pub_decl) = if subgroup {
         (
             format!(
@@ -2271,6 +2647,116 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 {sum_tree}{sum_pub}    {inv_sum}
 
     // one thread per f16 word — no read-modify-write races
+    for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
+        let j0 = w * 2u;
+        let j1 = j0 + 1u;
+        var e0 = 0.0;
+        var e1 = 0.0;
+        if (j0 < valid) {{
+            let v0 = half_at(unpack_h(X[base_x + w]), j0);
+            e0 = exp(v0 * scale - row_max) * inv_sum;
+        }}
+        if (j1 < valid) {{
+            let v1 = half_at(unpack_h(X[base_x + w]), j1);
+            e1 = exp(v1 * scale - row_max) * inv_sum;
+        }}
+        Out[base_o + w] = pack_h(vec2<f32>(e0, e1));
+    }}
+}}
+",
+        bs = bs,
+    )
+}
+
+/// Backward-compatible entry point: the Stage-2 shader, unchanged.
+pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+    softmax_causal_stage2(bs, subgroup)
+}
+
+/// Select the reduction path from device capabilities.
+pub fn softmax_causal_mode(bs: usize, mode: SubgroupMode) -> String {
+    match mode {
+        SubgroupMode::Warp32 => softmax_causal_stage2(bs, true),
+        SubgroupMode::None => softmax_causal_stage2(bs, false),
+        SubgroupMode::Generic => softmax_causal_generic(bs),
+    }
+}
+
+/// Portable subgroup reduction using WGSL `subgroupMax` / `subgroupAdd` for
+/// adapters whose subgroup width is not fixed at 32 (e.g. AMD Wave64, Intel Xe
+/// 8/16).  wgpu 30 / Naga enables subgroup builtins via `Features::SUBGROUP`
+/// without an `enable subgroups;` directive.
+fn softmax_causal_generic(bs: usize) -> String {
+    assert!(bs.is_power_of_two() && bs >= 32, "softmax_causal: block size");
+    format!(
+        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
+
+@group(0) @binding(0) var<storage, read>       X:   array<u32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: Cfg;
+
+const BS: u32 = {bs}u;
+
+{HALF_AT}
+var<workgroup> sg_red: array<f32, {bs}>;
+var<workgroup> pub_red: array<f32, 1>;
+
+@compute @workgroup_size({bs})
+fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>,
+           @builtin(subgroup_invocation_id) sg_lid: u32,
+           @builtin(subgroup_size) sg_size: u32) {{
+    let row = wgid.x + wgid.y * cfg.gx;
+    let head = row / cfg.m;
+    let pos = row % cfg.m;
+    let base_x = (head * cfg.mp + pos) * cfg.n_x;
+    let base_o = (head * cfg.mp + pos) * cfg.n_w;
+    let valid = min(cfg.valid, max(pos + 1u, cfg.row0) - cfg.row0);
+    let scale = cfg.scale;
+
+    if (valid == 0u) {{
+        for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
+            Out[base_o + w] = 0u;
+        }}
+        return;
+    }}
+
+    let sg_id = lid.x / sg_size;
+    let n_sg = (BS + sg_size - 1u) / sg_size;
+
+    var lmax = bitcast<f32>(0xFF800000u);
+    for (var j = lid.x; j < valid; j = j + BS) {{
+        let v = half_at(unpack_h(X[base_x + (j >> 1u)]), j);
+        let sc = v * scale;
+        if (sc > lmax) {{ lmax = sc; }}
+    }}
+    let sg_m = subgroupMax(lmax);
+    if (sg_lid == 0u) {{ sg_red[sg_id] = sg_m; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        var gm = sg_red[0];
+        for (var k = 1u; k < n_sg; k = k + 1u) {{ gm = max(gm, sg_red[k]); }}
+        pub_red[0] = gm;
+    }}
+    workgroupBarrier();
+    let row_max = pub_red[0];
+
+    var lsum = 0.0;
+    for (var j = lid.x; j < valid; j = j + BS) {{
+        let v = half_at(unpack_h(X[base_x + (j >> 1u)]), j);
+        lsum = lsum + exp(v * scale - row_max);
+    }}
+    let sg_s = subgroupAdd(lsum);
+    if (sg_lid == 0u) {{ sg_red[sg_id] = sg_s; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        var gs = 0.0;
+        for (var k = 0u; k < n_sg; k = k + 1u) {{ gs = gs + sg_red[k]; }}
+        pub_red[0] = 1.0 / gs;
+    }}
+    workgroupBarrier();
+    let inv_sum = pub_red[0];
+
     for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
         let j0 = w * 2u;
         let j1 = j0 + 1u;
